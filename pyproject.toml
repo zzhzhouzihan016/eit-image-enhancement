@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eit-image-enhancement"
+version = "0.1.0"
+description = "EIT 图像增强与实验分析项目"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy",
+  "scipy",
+  "matplotlib",
+  "opencv-python",
+  "torch",
+  "tqdm",
+  "PyYAML",
+  "wandb",
+  "h5py",
+  "scikit-image",
+  "plotly",
+  "scikit-optimize",
+  "pydicom",
+  "pyeit",
+  "pygmsh",
+  "gmsh",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

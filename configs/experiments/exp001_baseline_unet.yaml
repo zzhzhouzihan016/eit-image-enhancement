@@ -1,0 +1,52 @@
+# ================= 实验基本信息 =================
+experiment_name: "exp001_baseline_unet"
+save_dir: "outputs/experiments/exp001_baseline_run1"
+seed: 42
+
+# ================= 数据集配置 (关键修改) =================
+data:
+  # 🚀 修改 1: 指向你刚刚转换好的新数据路径
+  train_path: "data/processed/train_sim/npz/eit_pathology_dataHR_200seq.npz"
+
+  img_size_h: 176
+  img_size_w: 256  # 注意: 之前的代码resize到了256
+
+  # 🚀 修改 2: 显式指定帧数 (v6数据是32帧)
+  frames_per_seq: 32
+
+  batch_size: 32   # 32帧的数据显存占用不大，32的batch size应该没问题
+  num_workers: 4
+
+# ================= 模型配置 =================
+model:
+  name: "st_unet"
+  params:
+    n_frames: 5
+    n_classes: 1
+    bilinear: True
+
+# ================= 训练超参数 =================
+train:
+  epochs: 100            # 🚀 修改 3: 统一设为 100 (之前一个是60一个是100)
+  learning_rate: 0.0001
+  weight_decay: 1e-5
+
+  optimizer: "AdamW"
+  scheduler: "CosineAnnealingLR"
+
+  loss_weights:
+    l1: 1.0
+    edge: 0.5
+
+logging:
+  save_freq: 10          # 每10个epoch保存一次可视化图
+  val_freq: 1            # 每个epoch都验证
+  print_freq: 10         # 打印频率
+
+# ================= WandB 配置 =================
+wandb:
+  enable: True
+  project: "EIT_Enhancement"
+  entity: null               # 可选：填写你的 team entity
+  name: "Exp1_Baseline_UNet_run1"
+  tags: ["baseline", "v6_data"]

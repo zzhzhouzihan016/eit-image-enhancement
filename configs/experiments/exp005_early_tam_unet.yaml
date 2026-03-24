@@ -1,0 +1,46 @@
+# ================= 实验基本信息 =================
+experiment_name: "exp005_early_tam_unet"
+save_dir: "outputs/experiments/exp005_early_tam_unet_run1"
+seed: 42
+
+# ================= 数据集配置 =================
+data:
+  # 🚀 保持与 Baseline 完全一致
+  train_path: "data/processed/train_sim/npz/eit_pathology_dataHR_200seq.npz"
+  img_size_h: 176
+  img_size_w: 256
+  frames_per_seq: 32
+  batch_size: 32
+  num_workers: 4
+
+# ================= 模型配置 =================
+model:
+  name: "st_unet_early_tam"   # <--- 唯一区别：模型名字
+  params:
+    n_frames: 5
+    n_classes: 1
+    bilinear: True
+
+# ================= 训练超参数 =================
+train:
+  epochs: 100            # 保持一致
+  learning_rate: 0.0001
+  weight_decay: 1e-5
+  optimizer: "AdamW"
+  scheduler: "CosineAnnealingLR"
+  loss_weights:
+    l1: 1.0
+    edge: 0.5
+
+logging:
+  save_freq: 10          # 每10个epoch保存一次可视化图
+  val_freq: 1            # 每个epoch都验证
+  print_freq: 10         # 打印频率
+
+# ================= WandB 配置 =================
+wandb:
+  enable: True
+  project: "EIT_Enhancement"
+  entity: null
+  name: "Exp5_Early_TAM_UNet_run1"  # 区分实验名
+  tags: ["early_tam"]

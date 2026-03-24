@@ -1,0 +1,36 @@
+.DS_Store
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+*.log
+
+# macOS / editors
+Thumbs.db
+
+# local environments
+.venv/
+venv/
+
+# archives / external repos / checkpoints
+archives/*
+!archives/.gitkeep
+checkpoints/*
+!checkpoints/.gitkeep
+
+# datasets
+data/raw/*
+!data/raw/.gitkeep
+data/real_data/
+data/processed/*
+!data/processed/.gitkeep
+data/interim/*
+!data/interim/.gitkeep
+
+# derived outputs
+outputs/*
+!outputs/.gitkeep
