@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Callable
 
 from .dual_source_seq_unet import DualSourceSeqUNet
+from .dual_source_temporal_film_unet import DualSourceTemporalFiLMUNet
 from .recon_seq_unet import ReconSeqUNet
 from .unet import ST_UNet
 from .unet_early_cbam import ST_UNet_EarlyCBAM
@@ -81,6 +82,20 @@ def _build_dual_source_seq_unet(params: dict) -> DualSourceSeqUNet:
     )
 
 
+def _build_dual_source_temporal_film_unet(params: dict) -> DualSourceTemporalFiLMUNet:
+    return DualSourceTemporalFiLMUNet(
+        n_frames=params.get("n_frames", 20),
+        voltage_dim=params.get("voltage_dim", 208),
+        out_frames=params.get("out_frames", params.get("n_classes", params.get("n_frames", 20))),
+        bilinear=params.get("bilinear", True),
+        base_channels=params.get("base_channels", 32),
+        voltage_hidden=params.get("voltage_hidden", 64),
+        temporal_hidden=params.get("temporal_hidden", 128),
+        gru_layers=params.get("gru_layers", 1),
+        output_size=tuple(params.get("output_size", [64, 64])),
+    )
+
+
 def _build_recon_seq_unet(params: dict) -> ReconSeqUNet:
     return ReconSeqUNet(
         n_frames=params.get("n_frames", 20),
@@ -100,6 +115,7 @@ MODEL_REGISTRY: dict[str, Callable[[dict], object]] = {
     "st_unet_neck_tam": _build_st_unet_neck_tam,
     "st_unet_early_tam": _build_st_unet_early_tam,
     "dual_source_seq_unet": _build_dual_source_seq_unet,
+    "dual_source_temporal_film_unet": _build_dual_source_temporal_film_unet,
     "recon_seq_unet": _build_recon_seq_unet,
 }
 

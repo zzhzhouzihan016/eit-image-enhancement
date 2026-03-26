@@ -1,0 +1,85 @@
+# ================= 实验基本信息 =================
+experiment_name: "exp103_dual_source_temporal_film_unet"
+save_dir: "outputs/experiments/exp103_dual_source_temporal_film_unet_run1"
+seed: 42
+
+# ================= 数据集配置 =================
+data:
+  dataset_type: "dual_source_lctsc"
+  dataset_root: "data/processed/train_sim/lctsc_cem_pathology_jac32_gt64"
+  manifest_name: "global_samples_manifest.csv"
+  batch_size: 8
+  num_workers: 4
+
+  noise:
+    mode: "fixed"
+    fixed_index: 2
+
+  case_split:
+    train_case_ids:
+      - "LCTSC-Train-S3-010"
+      - "LCTSC-Test-S1-204"
+      - "LCTSC-Test-S1-201"
+      - "LCTSC-Train-S1-012"
+      - "LCTSC-Test-S2-203"
+      - "LCTSC-Train-S1-007"
+      - "LCTSC-Train-S2-001"
+      - "LCTSC-Train-S3-005"
+      - "LCTSC-Test-S2-101"
+      - "LCTSC-Train-S1-008"
+      - "LCTSC-Train-S2-012"
+      - "LCTSC-Train-S1-010"
+      - "LCTSC-Train-S1-001"
+      - "LCTSC-Test-S1-104"
+      - "LCTSC-Train-S1-005"
+    val_case_ids:
+      - "LCTSC-Test-S1-203"
+      - "LCTSC-Train-S2-007"
+      - "LCTSC-Test-S2-102"
+    test_case_ids:
+      - "LCTSC-Test-S2-104"
+      - "LCTSC-Test-S1-102"
+      - "LCTSC-Test-S1-202"
+      - "LCTSC-Train-S3-008"
+
+# ================= 模型配置 =================
+model:
+  name: "dual_source_temporal_film_unet"
+  params:
+    n_frames: 20
+    voltage_dim: 208
+    out_frames: 20
+    bilinear: True
+    base_channels: 32
+    voltage_hidden: 64
+    temporal_hidden: 128
+    gru_layers: 1
+    output_size: [64, 64]
+
+# ================= 训练超参数 =================
+train:
+  epochs: 300
+  learning_rate: 0.0001
+  weight_decay: 1e-5
+  optimizer: "AdamW"
+  scheduler: "CosineAnnealingLR"
+
+  loss_weights:
+    l1: 1.0
+    edge: 0.2
+    temporal: 0.1
+
+logging:
+  save_freq: 5
+  val_freq: 1
+  print_freq: 10
+
+# ================= WandB 配置 =================
+wandb:
+  enable: True
+  project: "EIT_Enhancement"
+  entity: null
+  # 如果你想只在本地记录，取消下一行注释：
+  # mode: "offline"
+  name: "Exp103_Dual_Source_Temporal_FiLM_UNet_run1"
+  tags: ["dual_source", "temporal_modeling", "gru", "20frames", "jac32_to_gt64"]
