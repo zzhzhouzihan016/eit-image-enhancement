@@ -25,7 +25,11 @@ try:
 except ImportError:
     wandb = None
 
-from eit.dataset_dual_source import LCTSCDualSourceDataset, build_case_splits_from_manifest
+from eit.dataset_dual_source import (
+    LCTSCDualSourceDataset,
+    LCTSCReconSequenceDataset,
+    build_case_splits_from_manifest,
+)
 from eit.models import get_model
 from eit.utils.seed import set_seed
 
@@ -91,9 +95,11 @@ def forward_model(model: nn.Module, model_inputs):
 def prepare_batch(batch, device: torch.device):
     if isinstance(batch, dict):
         recon = batch["recon"].to(device)
-        voltage = batch["voltage"].to(device)
         target = batch["target"].to(device)
-        return {"recon": recon, "voltage": voltage}, target, recon, target.size(0)
+        model_inputs = {"recon": recon}
+        if "voltage" in batch:
+            model_inputs["voltage"] = batch["voltage"].to(device)
+        return model_inputs, target, recon, target.size(0)
 
     inputs, targets = batch
     inputs = inputs.to(device)
@@ -351,13 +357,8 @@ def build_single_source_dataloaders(cfg: dict, seed: int):
     return train_loader, val_loader, None
 
 
-def build_dual_source_dataloaders(cfg: dict, seed: int):
-    data_cfg = cfg["data"]
-    batch_size = int(data_cfg["batch_size"])
-    num_workers = int(data_cfg.get("num_workers", 4))
-    dataset_root = data_cfg["dataset_root"]
+def _resolve_lctsc_case_splits(data_cfg: dict, seed: int) -> tuple[str, dict[str, list[str]]]:
     manifest_name = data_cfg.get("manifest_name", "global_samples_manifest.csv")
-
     case_split_cfg = data_cfg.get("case_split", {})
     train_case_ids = case_split_cfg.get("train_case_ids")
     val_case_ids = case_split_cfg.get("val_case_ids")
@@ -365,44 +366,54 @@ def build_dual_source_dataloaders(cfg: dict, seed: int):
 
     if train_case_ids is None or val_case_ids is None:
         splits = build_case_splits_from_manifest(
-            dataset_root=dataset_root,
+            dataset_root=data_cfg["dataset_root"],
             manifest_name=manifest_name,
             train_ratio=float(case_split_cfg.get("train_ratio", 0.7)),
             val_ratio=float(case_split_cfg.get("val_ratio", 0.15)),
             seed=seed,
         )
-        train_case_ids = splits["train"]
-        val_case_ids = splits["val"]
-        test_case_ids = splits["test"] if test_case_ids is None else test_case_ids
     else:
-        test_case_ids = test_case_ids or []
-        splits = {"train": list(train_case_ids), "val": list(val_case_ids), "test": list(test_case_ids)}
+        splits = {
+            "train": list(train_case_ids),
+            "val": list(val_case_ids),
+            "test": list(test_case_ids or []),
+        }
+
+    return manifest_name, splits
+
+
+def _build_lctsc_sequence_dataloaders(cfg: dict, seed: int, dataset_cls, dataset_label: str):
+    data_cfg = cfg["data"]
+    batch_size = int(data_cfg["batch_size"])
+    num_workers = int(data_cfg.get("num_workers", 4))
+    dataset_root = data_cfg["dataset_root"]
+    manifest_name, splits = _resolve_lctsc_case_splits(data_cfg, seed)
 
     noise_cfg = data_cfg.get("noise", {})
     noise_mode = noise_cfg.get("mode", "fixed")
     fixed_noise_index = int(noise_cfg.get("fixed_index", 2))
     noise_indices = noise_cfg.get("indices")
 
-    train_ds = LCTSCDualSourceDataset(
+    train_ds = dataset_cls(
         dataset_root=dataset_root,
         manifest_name=manifest_name,
-        case_ids=train_case_ids,
+        case_ids=splits["train"],
         noise_mode=noise_mode,
         fixed_noise_index=fixed_noise_index,
         noise_indices=noise_indices,
     )
-    val_ds = LCTSCDualSourceDataset(
+    val_ds = dataset_cls(
         dataset_root=dataset_root,
         manifest_name=manifest_name,
-        case_ids=val_case_ids,
+        case_ids=splits["val"],
         noise_mode=noise_mode,
         fixed_noise_index=fixed_noise_index,
         noise_indices=noise_indices,
     )
 
     print(
-        "📊 Dual-source Split: "
-        f"TrainCases={len(train_case_ids)}, ValCases={len(val_case_ids)}, TestCases={len(test_case_ids)} | "
+        f"📊 {dataset_label} Split: "
+        f"TrainCases={len(splits['train'])}, ValCases={len(splits['val'])}, TestCases={len(splits['test'])} | "
         f"TrainSamples={len(train_ds)}, ValSamples={len(val_ds)}"
     )
 
@@ -416,10 +427,30 @@ def build_dual_source_dataloaders(cfg: dict, seed: int):
     return train_loader, val_loader, splits
 
 
+def build_dual_source_dataloaders(cfg: dict, seed: int):
+    return _build_lctsc_sequence_dataloaders(
+        cfg,
+        seed,
+        dataset_cls=LCTSCDualSourceDataset,
+        dataset_label="Dual-source",
+    )
+
+
+def build_recon_sequence_dataloaders(cfg: dict, seed: int):
+    return _build_lctsc_sequence_dataloaders(
+        cfg,
+        seed,
+        dataset_cls=LCTSCReconSequenceDataset,
+        dataset_label="Single-source LCTSC",
+    )
+
+
 def build_dataloaders(cfg: dict, seed: int):
     dataset_type = cfg["data"].get("dataset_type", "single_sequence")
     if dataset_type == "dual_source_lctsc":
         return build_dual_source_dataloaders(cfg, seed)
+    if dataset_type == "single_source_lctsc_seq":
+        return build_recon_sequence_dataloaders(cfg, seed)
     return build_single_source_dataloaders(cfg, seed)
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Callable
 
 from .dual_source_seq_unet import DualSourceSeqUNet
+from .recon_seq_unet import ReconSeqUNet
 from .unet import ST_UNet
 from .unet_early_cbam import ST_UNet_EarlyCBAM
 from .unet_early_sam import ST_UNet_EarlySAM
@@ -80,6 +81,16 @@ def _build_dual_source_seq_unet(params: dict) -> DualSourceSeqUNet:
     )
 
 
+def _build_recon_seq_unet(params: dict) -> ReconSeqUNet:
+    return ReconSeqUNet(
+        n_frames=params.get("n_frames", 20),
+        out_frames=params.get("out_frames", params.get("n_classes", params.get("n_frames", 20))),
+        bilinear=params.get("bilinear", True),
+        base_channels=params.get("base_channels", 32),
+        output_size=tuple(params.get("output_size", [64, 64])),
+    )
+
+
 MODEL_REGISTRY: dict[str, Callable[[dict], object]] = {
     "st_unet": _build_st_unet,
     "st_unet_neck_cbam": _build_st_unet_neck_cbam,
@@ -89,6 +100,7 @@ MODEL_REGISTRY: dict[str, Callable[[dict], object]] = {
     "st_unet_neck_tam": _build_st_unet_neck_tam,
     "st_unet_early_tam": _build_st_unet_early_tam,
     "dual_source_seq_unet": _build_dual_source_seq_unet,
+    "recon_seq_unet": _build_recon_seq_unet,
 }
 
 
