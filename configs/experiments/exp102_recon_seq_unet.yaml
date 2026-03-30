@@ -11,6 +11,17 @@ data:
   batch_size: 8
   num_workers: 4
 
+  augmentation:
+    enable: true
+    recon_noise_std: 0.01
+    recon_scale_range: [0.98, 1.02]
+
+  intra_val:
+    enable: true
+    ratio: 0.12
+    group_by: "slice"
+    seed: 42
+
   noise:
     mode: "fixed"
     fixed_index: 2
@@ -62,8 +73,22 @@ train:
 
   loss_weights:
     l1: 1.0
+    roi: 0.5
     edge: 0.2
     temporal: 0.1
+
+  roi:
+    margin: 6
+    mask_threshold: 0.5
+
+  monitor_split: "val_inter"
+  monitor_metric: "ssim"
+  monitor_mode: "max"
+
+  early_stopping:
+    enable: true
+    patience: 60
+    min_delta: 0.0
 
 logging:
   save_freq: 5

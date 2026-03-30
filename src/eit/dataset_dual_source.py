@@ -57,6 +57,8 @@ def _build_record_meta(record: DualSourceRecord) -> dict[str, Any]:
         "case_id": record.case_id,
         "slice_index": record.slice_index,
         "sample_name": record.sample_name,
+        "record_key": build_record_key(record.case_id, record.slice_index, record.sample_name),
+        "slice_group_key": build_slice_group_key(record.case_id, record.slice_index),
         "pathology_label": record.pathology_label,
         "lung_side": record.lung_side or "",
         "severity_level": record.severity_level,
@@ -76,6 +78,14 @@ def resolve_dual_source_dataset_root(path_like: str | Path | None = None) -> Pat
 
 def build_relative_sample_dir(case_id: str, slice_index: int, sample_name: str) -> Path:
     return Path("cases") / case_id / "slices" / f"slice_{slice_index:03d}" / sample_name
+
+
+def build_record_key(case_id: str, slice_index: int, sample_name: str) -> str:
+    return f"{case_id}::slice_{int(slice_index):03d}::{sample_name}"
+
+
+def build_slice_group_key(case_id: str, slice_index: int) -> str:
+    return f"{case_id}::slice_{int(slice_index):03d}"
 
 
 def discover_case_ids(
@@ -169,6 +179,8 @@ class LCTSCDualSourceDataset(Dataset):
         manifest_name: str = DEFAULT_MANIFEST_NAME,
         case_ids: Sequence[str] | None = None,
         exclude_case_ids: Sequence[str] | None = None,
+        record_keys: Sequence[str] | None = None,
+        exclude_record_keys: Sequence[str] | None = None,
         noise_mode: str = "fixed",
         fixed_noise_index: int = DEFAULT_NOISE_INDEX,
         noise_indices: Sequence[int] | None = None,
@@ -208,6 +220,8 @@ class LCTSCDualSourceDataset(Dataset):
         self.records = self._load_records(
             case_ids=case_ids,
             exclude_case_ids=exclude_case_ids,
+            record_keys=record_keys,
+            exclude_record_keys=exclude_record_keys,
             verify_files=verify_files,
         )
         self.index: list[tuple[DualSourceRecord, int]] = self._build_index()
@@ -220,10 +234,14 @@ class LCTSCDualSourceDataset(Dataset):
         self,
         case_ids: Sequence[str] | None,
         exclude_case_ids: Sequence[str] | None,
+        record_keys: Sequence[str] | None,
+        exclude_record_keys: Sequence[str] | None,
         verify_files: bool,
     ) -> list[DualSourceRecord]:
         include_set = set(case_ids) if case_ids is not None else None
         exclude_set = set(exclude_case_ids or [])
+        include_record_set = set(record_keys) if record_keys is not None else None
+        exclude_record_set = set(exclude_record_keys or [])
 
         records: list[DualSourceRecord] = []
         with open(self.manifest_path, "r", encoding="utf-8", newline="") as file:
@@ -233,6 +251,15 @@ class LCTSCDualSourceDataset(Dataset):
                 if include_set is not None and case_id not in include_set:
                     continue
                 if case_id in exclude_set:
+                    continue
+                record_key = build_record_key(
+                    case_id=row["case_id"],
+                    slice_index=_parse_int(row["slice_index"]),
+                    sample_name=row["sample_name"],
+                )
+                if include_record_set is not None and record_key not in include_record_set:
+                    continue
+                if record_key in exclude_record_set:
                     continue
 
                 sample_dir, npz_path, metadata_path = _resolve_record_paths(self.dataset_root, row)
@@ -346,6 +373,8 @@ class LCTSCReconSequenceDataset(LCTSCDualSourceDataset):
         manifest_name: str = DEFAULT_MANIFEST_NAME,
         case_ids: Sequence[str] | None = None,
         exclude_case_ids: Sequence[str] | None = None,
+        record_keys: Sequence[str] | None = None,
+        exclude_record_keys: Sequence[str] | None = None,
         noise_mode: str = "fixed",
         fixed_noise_index: int = DEFAULT_NOISE_INDEX,
         noise_indices: Sequence[int] | None = None,
@@ -364,6 +393,8 @@ class LCTSCReconSequenceDataset(LCTSCDualSourceDataset):
             manifest_name=manifest_name,
             case_ids=case_ids,
             exclude_case_ids=exclude_case_ids,
+            record_keys=record_keys,
+            exclude_record_keys=exclude_record_keys,
             noise_mode=noise_mode,
             fixed_noise_index=fixed_noise_index,
             noise_indices=noise_indices,

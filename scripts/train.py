@@ -1,8 +1,10 @@
 import argparse
 import csv
 import math
+import random
 import sys
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -29,6 +31,8 @@ from eit.dataset_dual_source import (
     LCTSCDualSourceDataset,
     LCTSCReconSequenceDataset,
     build_case_splits_from_manifest,
+    build_record_key,
+    build_slice_group_key,
 )
 from eit.models import get_model
 from eit.utils.seed import set_seed
@@ -93,18 +97,65 @@ def forward_model(model: nn.Module, model_inputs):
 
 
 def prepare_batch(batch, device: torch.device):
+    extras: dict[str, Any] = {}
     if isinstance(batch, dict):
         recon = batch["recon"].to(device)
         target = batch["target"].to(device)
         model_inputs = {"recon": recon}
         if "voltage" in batch:
             model_inputs["voltage"] = batch["voltage"].to(device)
-        return model_inputs, target, recon, target.size(0)
+        if "mask" in batch:
+            extras["mask"] = batch["mask"].to(device)
+        if "meta" in batch:
+            extras["meta"] = batch["meta"]
+        return model_inputs, target, recon, target.size(0), extras
 
     inputs, targets = batch
     inputs = inputs.to(device)
     targets = targets.to(device)
-    return inputs, targets, inputs, targets.size(0)
+    return inputs, targets, inputs, targets.size(0), extras
+
+
+def expand_mask_like(mask: torch.Tensor | None, reference: torch.Tensor) -> torch.Tensor | None:
+    if mask is None:
+        return None
+
+    if reference.ndim == 4:
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0).unsqueeze(0)
+        elif mask.ndim == 3:
+            mask = mask.unsqueeze(1)
+        elif mask.ndim != 4:
+            raise ValueError(f"mask 期望维度为 2/3/4，实际为 {tuple(mask.shape)}")
+
+        if mask.shape[0] != reference.shape[0]:
+            raise ValueError("mask 与预测张量的 batch 维不一致。")
+        if mask.shape[1] == 1 and reference.shape[1] != 1:
+            mask = mask.expand(-1, reference.shape[1], -1, -1)
+        return mask
+
+    if reference.ndim == 3:
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+        if mask.ndim != 3:
+            raise ValueError(f"mask 期望维度为 2/3，实际为 {tuple(mask.shape)}")
+        if mask.shape[0] != reference.shape[0]:
+            raise ValueError("mask 与预测张量的 batch 维不一致。")
+        return mask
+
+    raise ValueError(f"当前仅支持 3D/4D 预测张量，实际为 {tuple(reference.shape)}")
+
+
+def extract_roi_bounds(mask_2d: torch.Tensor, margin: int = 0, threshold: float = 0.5) -> tuple[int, int, int, int] | None:
+    positive = torch.nonzero(mask_2d > threshold, as_tuple=False)
+    if positive.numel() == 0:
+        return None
+
+    y0 = max(int(positive[:, 0].min().item()) - margin, 0)
+    y1 = min(int(positive[:, 0].max().item()) + margin + 1, int(mask_2d.shape[0]))
+    x0 = max(int(positive[:, 1].min().item()) - margin, 0)
+    x1 = min(int(positive[:, 1].max().item()) + margin + 1, int(mask_2d.shape[1]))
+    return y0, y1, x0, x1
 
 
 class EITMetrics:
@@ -119,7 +170,7 @@ class EITMetrics:
         else:
             ranges = torch.full_like(mse, float(data_range))
 
-        psnr_val = 10 * torch.log10((ranges ** 2) / (mse + 1e-8))
+        psnr_val = 10 * torch.log10((ranges**2) / (mse + 1e-8))
         return torch.mean(psnr_val).item()
 
     @staticmethod
@@ -129,7 +180,7 @@ class EITMetrics:
         p_mean = p - torch.mean(p, dim=1, keepdim=True)
         t_mean = t - torch.mean(t, dim=1, keepdim=True)
         num = torch.sum(p_mean * t_mean, dim=1)
-        den = torch.sqrt(torch.sum(p_mean ** 2, dim=1)) * torch.sqrt(torch.sum(t_mean ** 2, dim=1))
+        den = torch.sqrt(torch.sum(p_mean**2, dim=1)) * torch.sqrt(torch.sum(t_mean**2, dim=1))
         return torch.mean(num / (den + 1e-8)).item()
 
     @staticmethod
@@ -151,7 +202,7 @@ class EITMetrics:
 
         channel = preds_4d.size(1)
         gauss = torch.tensor(
-            [math.exp(-(x - window_size // 2) ** 2 / float(2 * window_sigma ** 2)) for x in range(window_size)],
+            [math.exp(-(x - window_size // 2) ** 2 / float(2 * window_sigma**2)) for x in range(window_size)],
             device=preds_4d.device,
             dtype=preds_4d.dtype,
         )
@@ -181,9 +232,56 @@ class EITMetrics:
         )
         return ssim_map.mean().item()
 
+    @classmethod
+    def roi_metrics(
+        cls,
+        preds: torch.Tensor,
+        targets: torch.Tensor,
+        masks: torch.Tensor | None,
+        margin: int = 6,
+        mask_threshold: float = 0.5,
+    ) -> tuple[float, float, float, int]:
+        if masks is None:
+            return float("nan"), float("nan"), float("nan"), 0
+
+        if masks.ndim == 4 and masks.shape[1] == 1:
+            masks_2d = masks[:, 0]
+        elif masks.ndim == 3:
+            masks_2d = masks
+        else:
+            raise ValueError(f"ROI metric 期望 mask 为 [B,H,W] 或 [B,1,H,W]，实际为 {tuple(masks.shape)}")
+
+        roi_l1_values: list[float] = []
+        roi_psnr_values: list[float] = []
+        roi_ssim_values: list[float] = []
+
+        for sample_index in range(preds.shape[0]):
+            bounds = extract_roi_bounds(masks_2d[sample_index], margin=margin, threshold=mask_threshold)
+            if bounds is None:
+                continue
+            y0, y1, x0, x1 = bounds
+            pred_crop = preds[sample_index : sample_index + 1, ..., y0:y1, x0:x1]
+            target_crop = targets[sample_index : sample_index + 1, ..., y0:y1, x0:x1]
+
+            roi_l1_values.append(torch.mean(torch.abs(pred_crop - target_crop)).item())
+            roi_psnr_values.append(cls.psnr(pred_crop, target_crop))
+            roi_ssim_values.append(cls.ssim(pred_crop, target_crop))
+
+        valid_count = len(roi_l1_values)
+        if valid_count == 0:
+            return float("nan"), float("nan"), float("nan"), 0
+
+        return (
+            float(sum(roi_l1_values) / valid_count),
+            float(sum(roi_psnr_values) / valid_count),
+            float(sum(roi_ssim_values) / valid_count),
+            valid_count,
+        )
+
 
 class MetricTracker:
-    def __init__(self):
+    def __init__(self, prefix: str = "val"):
+        self.prefix = prefix
         self.reset()
 
     def reset(self) -> None:
@@ -192,9 +290,25 @@ class MetricTracker:
         self.ssim = 0.0
         self.cc = 0.0
         self.rie = 0.0
+        self.roi_l1 = 0.0
+        self.roi_psnr = 0.0
+        self.roi_ssim = 0.0
         self.count = 0
+        self.roi_count = 0
 
-    def update(self, loss: float, p: float, s: float, c: float, r: float, n: int = 1) -> None:
+    def update(
+        self,
+        loss: float,
+        p: float,
+        s: float,
+        c: float,
+        r: float,
+        n: int = 1,
+        roi_l1: float | None = None,
+        roi_psnr: float | None = None,
+        roi_ssim: float | None = None,
+        roi_n: int = 0,
+    ) -> None:
         self.val_loss += loss * n
         self.psnr += p * n
         self.ssim += s * n
@@ -202,14 +316,30 @@ class MetricTracker:
         self.rie += r * n
         self.count += n
 
+        if roi_n > 0 and roi_l1 is not None and roi_psnr is not None and roi_ssim is not None:
+            self.roi_l1 += roi_l1 * roi_n
+            self.roi_psnr += roi_psnr * roi_n
+            self.roi_ssim += roi_ssim * roi_n
+            self.roi_count += roi_n
+
     def avg(self) -> dict[str, float]:
-        return {
-            "val/loss": self.val_loss / self.count,
-            "val/psnr": self.psnr / self.count,
-            "val/ssim": self.ssim / self.count,
-            "val/cc": self.cc / self.count,
-            "val/rie": self.rie / self.count,
+        metrics = {
+            f"{self.prefix}/loss": self.val_loss / self.count,
+            f"{self.prefix}/psnr": self.psnr / self.count,
+            f"{self.prefix}/ssim": self.ssim / self.count,
+            f"{self.prefix}/cc": self.cc / self.count,
+            f"{self.prefix}/rie": self.rie / self.count,
+            f"{self.prefix}/roi_count": float(self.roi_count),
         }
+        if self.roi_count > 0:
+            metrics[f"{self.prefix}/roi_l1"] = self.roi_l1 / self.roi_count
+            metrics[f"{self.prefix}/roi_psnr"] = self.roi_psnr / self.roi_count
+            metrics[f"{self.prefix}/roi_ssim"] = self.roi_ssim / self.roi_count
+        else:
+            metrics[f"{self.prefix}/roi_l1"] = float("nan")
+            metrics[f"{self.prefix}/roi_psnr"] = float("nan")
+            metrics[f"{self.prefix}/roi_ssim"] = float("nan")
+        return metrics
 
 
 class EdgeLoss(nn.Module):
@@ -236,6 +366,93 @@ class TemporalDifferenceLoss(nn.Module):
         if pred.ndim != 4 or target.ndim != 4 or pred.shape[1] <= 1:
             return pred.new_tensor(0.0)
         return self.l1(pred[:, 1:] - pred[:, :-1], target[:, 1:] - target[:, :-1])
+
+
+class ROILoss(nn.Module):
+    def __init__(self, mask_threshold: float = 0.5):
+        super().__init__()
+        self.mask_threshold = float(mask_threshold)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+        expanded_mask = expand_mask_like(mask, pred)
+        if expanded_mask is None:
+            return pred.new_tensor(0.0)
+
+        roi_mask = (expanded_mask > self.mask_threshold).to(dtype=pred.dtype)
+        denom = roi_mask.sum()
+        if float(denom.item()) <= 0.0:
+            return pred.new_tensor(0.0)
+
+        return torch.sum(torch.abs(pred - target) * roi_mask) / denom
+
+
+class TensorNoiseScaleAugment:
+    def __init__(
+        self,
+        noise_std: float = 0.0,
+        scale_range: tuple[float, float] = (1.0, 1.0),
+        dropout_prob: float = 0.0,
+    ) -> None:
+        self.noise_std = float(noise_std)
+        self.scale_min = float(scale_range[0])
+        self.scale_max = float(scale_range[1])
+        self.dropout_prob = float(dropout_prob)
+
+        if self.scale_min <= 0 or self.scale_max <= 0:
+            raise ValueError("scale_range 必须为正数区间。")
+        if self.scale_min > self.scale_max:
+            raise ValueError("scale_range 的最小值不能大于最大值。")
+        if not 0.0 <= self.dropout_prob < 1.0:
+            raise ValueError("dropout_prob 必须在 [0, 1) 区间。")
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        out = tensor.clone()
+
+        if self.scale_min != 1.0 or self.scale_max != 1.0:
+            scale = float(torch.empty(1).uniform_(self.scale_min, self.scale_max).item())
+            out = out * scale
+
+        if self.noise_std > 0:
+            out = out + torch.randn_like(out) * self.noise_std
+
+        if self.dropout_prob > 0:
+            keep_mask = (torch.rand_like(out) >= self.dropout_prob).to(out.dtype)
+            out = out * keep_mask
+
+        return out
+
+
+def parse_scale_range(value: Any, default: tuple[float, float] = (1.0, 1.0)) -> tuple[float, float]:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        scalar = float(value)
+        return scalar, scalar
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return float(value[0]), float(value[1])
+    raise ValueError("scale_range 需要是标量或长度为 2 的列表/元组。")
+
+
+def build_lctsc_augmentation_transforms(data_cfg: dict, dataset_cls):
+    aug_cfg = data_cfg.get("augmentation", {})
+    if not bool(aug_cfg.get("enable", False)):
+        return None, None
+
+    recon_transform = TensorNoiseScaleAugment(
+        noise_std=float(aug_cfg.get("recon_noise_std", 0.0)),
+        scale_range=parse_scale_range(aug_cfg.get("recon_scale_range"), default=(1.0, 1.0)),
+        dropout_prob=float(aug_cfg.get("recon_dropout_prob", 0.0)),
+    )
+
+    voltage_transform = None
+    if dataset_cls is LCTSCDualSourceDataset:
+        voltage_transform = TensorNoiseScaleAugment(
+            noise_std=float(aug_cfg.get("voltage_noise_std", 0.0)),
+            scale_range=parse_scale_range(aug_cfg.get("voltage_scale_range"), default=(1.0, 1.0)),
+            dropout_prob=float(aug_cfg.get("voltage_dropout_prob", 0.0)),
+        )
+
+    return recon_transform, voltage_transform
 
 
 def inspect_single_source_npz(npz_path: str | Path, frames_per_seq_hint: int | None = None) -> tuple[int, int]:
@@ -354,32 +571,145 @@ def build_single_source_dataloaders(cfg: dict, seed: int):
     }
     train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
-    return train_loader, val_loader, None
+
+    split_info = {
+        "split_mode": "single_sequence",
+        "train_sequence_ids": train_sample_ids,
+        "val_sequence_ids": val_sample_ids,
+    }
+    return train_loader, {"val": val_loader}, split_info
 
 
 def _resolve_lctsc_case_splits(data_cfg: dict, seed: int) -> tuple[str, dict[str, list[str]]]:
     manifest_name = data_cfg.get("manifest_name", "global_samples_manifest.csv")
     case_split_cfg = data_cfg.get("case_split", {})
     train_case_ids = case_split_cfg.get("train_case_ids")
-    val_case_ids = case_split_cfg.get("val_case_ids")
+    val_inter_case_ids = case_split_cfg.get("val_inter_case_ids")
+    if val_inter_case_ids is None:
+        val_inter_case_ids = case_split_cfg.get("val_case_ids")
     test_case_ids = case_split_cfg.get("test_case_ids")
 
-    if train_case_ids is None or val_case_ids is None:
-        splits = build_case_splits_from_manifest(
+    if train_case_ids is None or val_inter_case_ids is None:
+        raw_splits = build_case_splits_from_manifest(
             dataset_root=data_cfg["dataset_root"],
             manifest_name=manifest_name,
             train_ratio=float(case_split_cfg.get("train_ratio", 0.7)),
             val_ratio=float(case_split_cfg.get("val_ratio", 0.15)),
             seed=seed,
         )
+        splits = {
+            "train": list(raw_splits["train"]),
+            "val_inter": list(raw_splits["val"]),
+            "test": list(raw_splits["test"]),
+        }
     else:
         splits = {
             "train": list(train_case_ids),
-            "val": list(val_case_ids),
+            "val_inter": list(val_inter_case_ids),
             "test": list(test_case_ids or []),
         }
 
     return manifest_name, splits
+
+
+def split_train_records_for_intra_val(
+    records,
+    ratio: float,
+    group_by: str,
+    seed: int,
+) -> dict[str, Any]:
+    if not 0.0 <= ratio < 1.0:
+        raise ValueError("intra_val.ratio 必须在 [0, 1) 区间内。")
+
+    all_record_keys = sorted(build_record_key(r.case_id, r.slice_index, r.sample_name) for r in records)
+
+    result = {
+        "enabled": False,
+        "group_by": group_by,
+        "ratio": ratio,
+        "train_record_keys": all_record_keys,
+        "val_intra_record_keys": [],
+        "train_group_keys": [],
+        "val_intra_group_keys": [],
+    }
+
+    if ratio <= 0 or len(records) < 2:
+        return result
+
+    if group_by not in {"sample", "slice"}:
+        raise ValueError("intra_val.group_by 仅支持 'sample' 或 'slice'。")
+
+    grouped_record_keys: dict[str, list[str]] = {}
+    for record in records:
+        record_key = build_record_key(record.case_id, record.slice_index, record.sample_name)
+        if group_by == "slice":
+            group_key = build_slice_group_key(record.case_id, record.slice_index)
+        else:
+            group_key = record_key
+        grouped_record_keys.setdefault(group_key, []).append(record_key)
+
+    group_keys = sorted(grouped_record_keys)
+    if len(group_keys) < 2:
+        return result
+
+    shuffled_group_keys = list(group_keys)
+    random.Random(seed).shuffle(shuffled_group_keys)
+
+    val_group_count = max(1, int(round(len(shuffled_group_keys) * ratio)))
+    if val_group_count >= len(shuffled_group_keys):
+        val_group_count = len(shuffled_group_keys) - 1
+    if val_group_count <= 0:
+        return result
+
+    val_intra_group_keys = sorted(shuffled_group_keys[:val_group_count])
+    train_group_keys = sorted(shuffled_group_keys[val_group_count:])
+    val_intra_record_keys = sorted(
+        record_key for group_key in val_intra_group_keys for record_key in grouped_record_keys[group_key]
+    )
+    train_record_keys = sorted(
+        record_key for group_key in train_group_keys for record_key in grouped_record_keys[group_key]
+    )
+
+    if not train_record_keys or not val_intra_record_keys:
+        return result
+
+    result.update(
+        {
+            "enabled": True,
+            "train_record_keys": train_record_keys,
+            "val_intra_record_keys": val_intra_record_keys,
+            "train_group_keys": train_group_keys,
+            "val_intra_group_keys": val_intra_group_keys,
+        }
+    )
+    return result
+
+
+def _build_dataset_kwargs(
+    dataset_cls,
+    dataset_root: str,
+    manifest_name: str,
+    case_ids: list[str],
+    noise_mode: str,
+    fixed_noise_index: int,
+    noise_indices,
+    recon_transform=None,
+    voltage_transform=None,
+    record_keys: list[str] | None = None,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "dataset_root": dataset_root,
+        "manifest_name": manifest_name,
+        "case_ids": case_ids,
+        "record_keys": record_keys,
+        "noise_mode": noise_mode,
+        "fixed_noise_index": fixed_noise_index,
+        "noise_indices": noise_indices,
+        "recon_transform": recon_transform,
+    }
+    if dataset_cls is LCTSCDualSourceDataset:
+        kwargs["voltage_transform"] = voltage_transform
+    return kwargs
 
 
 def _build_lctsc_sequence_dataloaders(cfg: dict, seed: int, dataset_cls, dataset_label: str):
@@ -387,44 +717,135 @@ def _build_lctsc_sequence_dataloaders(cfg: dict, seed: int, dataset_cls, dataset
     batch_size = int(data_cfg["batch_size"])
     num_workers = int(data_cfg.get("num_workers", 4))
     dataset_root = data_cfg["dataset_root"]
-    manifest_name, splits = _resolve_lctsc_case_splits(data_cfg, seed)
+    manifest_name, case_splits = _resolve_lctsc_case_splits(data_cfg, seed)
 
     noise_cfg = data_cfg.get("noise", {})
     noise_mode = noise_cfg.get("mode", "fixed")
     fixed_noise_index = int(noise_cfg.get("fixed_index", 2))
     noise_indices = noise_cfg.get("indices")
 
+    train_recon_transform, train_voltage_transform = build_lctsc_augmentation_transforms(data_cfg, dataset_cls)
+
+    probe_train_ds = dataset_cls(
+        **_build_dataset_kwargs(
+            dataset_cls=dataset_cls,
+            dataset_root=dataset_root,
+            manifest_name=manifest_name,
+            case_ids=case_splits["train"],
+            noise_mode=noise_mode,
+            fixed_noise_index=fixed_noise_index,
+            noise_indices=noise_indices,
+        )
+    )
+
+    intra_val_cfg = data_cfg.get("intra_val", {})
+    intra_val_ratio = float(intra_val_cfg.get("ratio", 0.0))
+    intra_val_group_by = str(intra_val_cfg.get("group_by", "slice"))
+    intra_val_seed = int(intra_val_cfg.get("seed", seed))
+    intra_val_split = split_train_records_for_intra_val(
+        probe_train_ds.records,
+        ratio=intra_val_ratio if bool(intra_val_cfg.get("enable", False)) else 0.0,
+        group_by=intra_val_group_by,
+        seed=intra_val_seed,
+    )
+
+    train_record_keys = intra_val_split["train_record_keys"] if intra_val_split["enabled"] else None
     train_ds = dataset_cls(
-        dataset_root=dataset_root,
-        manifest_name=manifest_name,
-        case_ids=splits["train"],
-        noise_mode=noise_mode,
-        fixed_noise_index=fixed_noise_index,
-        noise_indices=noise_indices,
-    )
-    val_ds = dataset_cls(
-        dataset_root=dataset_root,
-        manifest_name=manifest_name,
-        case_ids=splits["val"],
-        noise_mode=noise_mode,
-        fixed_noise_index=fixed_noise_index,
-        noise_indices=noise_indices,
+        **_build_dataset_kwargs(
+            dataset_cls=dataset_cls,
+            dataset_root=dataset_root,
+            manifest_name=manifest_name,
+            case_ids=case_splits["train"],
+            record_keys=train_record_keys,
+            noise_mode=noise_mode,
+            fixed_noise_index=fixed_noise_index,
+            noise_indices=noise_indices,
+            recon_transform=train_recon_transform,
+            voltage_transform=train_voltage_transform,
+        )
     )
 
-    print(
-        f"📊 {dataset_label} Split: "
-        f"TrainCases={len(splits['train'])}, ValCases={len(splits['val'])}, TestCases={len(splits['test'])} | "
-        f"TrainSamples={len(train_ds)}, ValSamples={len(val_ds)}"
-    )
-
+    val_loaders: dict[str, DataLoader] = {}
     loader_kwargs = {
         "batch_size": batch_size,
         "num_workers": num_workers,
         "pin_memory": torch.cuda.is_available(),
     }
+
+    if case_splits["val_inter"]:
+        val_inter_ds = dataset_cls(
+            **_build_dataset_kwargs(
+                dataset_cls=dataset_cls,
+                dataset_root=dataset_root,
+                manifest_name=manifest_name,
+                case_ids=case_splits["val_inter"],
+                noise_mode=noise_mode,
+                fixed_noise_index=fixed_noise_index,
+                noise_indices=noise_indices,
+            )
+        )
+        val_loaders["val_inter"] = DataLoader(val_inter_ds, shuffle=False, **loader_kwargs)
+    else:
+        val_inter_ds = None
+
+    if intra_val_split["enabled"]:
+        val_intra_ds = dataset_cls(
+            **_build_dataset_kwargs(
+                dataset_cls=dataset_cls,
+                dataset_root=dataset_root,
+                manifest_name=manifest_name,
+                case_ids=case_splits["train"],
+                record_keys=intra_val_split["val_intra_record_keys"],
+                noise_mode=noise_mode,
+                fixed_noise_index=fixed_noise_index,
+                noise_indices=noise_indices,
+            )
+        )
+        val_loaders["val_intra"] = DataLoader(val_intra_ds, shuffle=False, **loader_kwargs)
+    else:
+        val_intra_ds = None
+
+    if not val_loaders:
+        raise ValueError("当前未构建任何验证集，请检查 case_split 或 intra_val 配置。")
+
     train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
-    return train_loader, val_loader, splits
+
+    split_info: dict[str, Any] = {
+        "split_mode": "lctsc_case_split",
+        "train_cases": case_splits["train"],
+        "val_inter_cases": case_splits["val_inter"],
+        "test_cases": case_splits["test"],
+        "train_samples": len(train_ds),
+        "val_inter_samples": len(val_inter_ds) if val_inter_ds is not None else 0,
+        "val_intra": {
+            "enabled": bool(intra_val_split["enabled"]),
+            "group_by": intra_val_split["group_by"],
+            "ratio": intra_val_split["ratio"],
+            "train_group_count": len(intra_val_split["train_group_keys"]),
+            "val_intra_group_count": len(intra_val_split["val_intra_group_keys"]),
+            "train_record_count": len(intra_val_split["train_record_keys"]),
+            "val_intra_record_count": len(intra_val_split["val_intra_record_keys"]),
+            "val_intra_samples": len(val_intra_ds) if val_intra_ds is not None else 0,
+        },
+    }
+
+    print(
+        f"📊 {dataset_label} Split: "
+        f"TrainCases={len(case_splits['train'])}, ValInterCases={len(case_splits['val_inter'])}, "
+        f"TestCases={len(case_splits['test'])} | "
+        f"TrainSamples={len(train_ds)}, "
+        f"ValInterSamples={len(val_inter_ds) if val_inter_ds is not None else 0}, "
+        f"ValIntraSamples={len(val_intra_ds) if val_intra_ds is not None else 0}"
+    )
+    if intra_val_split["enabled"]:
+        print(
+            "   ↳ Intra-val split: "
+            f"group_by={intra_val_split['group_by']}, ratio={intra_val_split['ratio']:.2f}, "
+            f"train_groups={len(intra_val_split['train_group_keys'])}, "
+            f"val_groups={len(intra_val_split['val_intra_group_keys'])}"
+        )
+
+    return train_loader, val_loaders, split_info
 
 
 def build_dual_source_dataloaders(cfg: dict, seed: int):
@@ -463,7 +884,7 @@ def visualize_and_save(model, loader, device, save_dir: Path, epoch: int, num_sa
 
     try:
         batch = next(iter(loader))
-        model_inputs, targets, vis_inputs, _ = prepare_batch(batch, device)
+        model_inputs, targets, vis_inputs, _, _ = prepare_batch(batch, device)
         with torch.no_grad():
             preds = forward_model(model, model_inputs)
 
@@ -543,13 +964,162 @@ def init_wandb(cfg: dict) -> bool:
         return False
 
 
-def save_case_splits(save_dir: Path, splits: dict[str, list[str]] | None) -> None:
+def save_case_splits(save_dir: Path, splits: dict[str, Any] | None) -> None:
     if splits is None:
         return
 
     split_path = save_dir / "case_splits.yaml"
     with open(split_path, "w", encoding="utf-8") as file:
         yaml.safe_dump(splits, file, allow_unicode=True, sort_keys=False)
+
+
+def compute_loss(
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor | None,
+    l1_crit: nn.Module,
+    roi_crit: ROILoss,
+    edge_crit: EdgeLoss,
+    temporal_crit: TemporalDifferenceLoss,
+    loss_weights: dict[str, float],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    parts = {
+        "l1": l1_crit(preds, targets),
+        "roi": roi_crit(preds, targets, mask),
+        "edge": edge_crit(preds, targets),
+        "temporal": temporal_crit(preds, targets),
+    }
+
+    total_loss = preds.new_tensor(0.0)
+    for name, value in parts.items():
+        total_loss = total_loss + float(loss_weights.get(name, 0.0)) * value
+    return total_loss, parts
+
+
+def evaluate_loader(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    prefix: str,
+    l1_crit: nn.Module,
+    roi_crit: ROILoss,
+    edge_crit: EdgeLoss,
+    temporal_crit: TemporalDifferenceLoss,
+    loss_weights: dict[str, float],
+    roi_margin: int,
+    roi_mask_threshold: float,
+) -> dict[str, float]:
+    tracker = MetricTracker(prefix=prefix)
+    model.eval()
+
+    with torch.no_grad():
+        for batch in loader:
+            model_inputs, targets, _, batch_size, extras = prepare_batch(batch, device)
+            preds = forward_model(model, model_inputs)
+            mask = extras.get("mask")
+
+            val_loss, _ = compute_loss(
+                preds=preds,
+                targets=targets,
+                mask=mask,
+                l1_crit=l1_crit,
+                roi_crit=roi_crit,
+                edge_crit=edge_crit,
+                temporal_crit=temporal_crit,
+                loss_weights=loss_weights,
+            )
+            roi_l1, roi_psnr, roi_ssim, roi_n = EITMetrics.roi_metrics(
+                preds,
+                targets,
+                mask,
+                margin=roi_margin,
+                mask_threshold=roi_mask_threshold,
+            )
+
+            tracker.update(
+                val_loss.item(),
+                EITMetrics.psnr(preds, targets),
+                EITMetrics.ssim(preds, targets),
+                EITMetrics.cc(preds, targets),
+                EITMetrics.rie(preds, targets),
+                n=batch_size,
+                roi_l1=roi_l1,
+                roi_psnr=roi_psnr,
+                roi_ssim=roi_ssim,
+                roi_n=roi_n,
+            )
+
+    return tracker.avg()
+
+
+def metric_fieldnames_for_prefix(prefix: str) -> list[str]:
+    return [
+        f"{prefix}/loss",
+        f"{prefix}/psnr",
+        f"{prefix}/ssim",
+        f"{prefix}/cc",
+        f"{prefix}/rie",
+        f"{prefix}/roi_l1",
+        f"{prefix}/roi_psnr",
+        f"{prefix}/roi_ssim",
+        f"{prefix}/roi_count",
+    ]
+
+
+def choose_monitor(train_cfg: dict, val_loaders: dict[str, DataLoader]) -> tuple[str, str, str]:
+    default_split = "val_inter" if "val_inter" in val_loaders else next(iter(val_loaders.keys()))
+    monitor_split = str(train_cfg.get("monitor_split", default_split))
+    if monitor_split not in val_loaders:
+        raise ValueError(f"monitor_split={monitor_split} 不存在，可选值: {list(val_loaders.keys())}")
+
+    monitor_metric = str(train_cfg.get("monitor_metric", "ssim"))
+    if monitor_metric not in {"loss", "psnr", "ssim", "cc", "rie", "roi_l1", "roi_psnr", "roi_ssim"}:
+        raise ValueError(
+            "monitor_metric 仅支持 "
+            "{'loss', 'psnr', 'ssim', 'cc', 'rie', 'roi_l1', 'roi_psnr', 'roi_ssim'}。"
+        )
+    monitor_mode = str(train_cfg.get("monitor_mode", "max")).lower()
+    if monitor_mode not in {"max", "min"}:
+        raise ValueError("monitor_mode 仅支持 'max' 或 'min'。")
+
+    return monitor_split, monitor_metric, monitor_mode
+
+
+def is_improved(current: float, best: float | None, mode: str, min_delta: float = 0.0) -> bool:
+    if not math.isfinite(current):
+        return False
+    if best is None:
+        return True
+    if mode == "max":
+        return current > best + min_delta
+    return current < best - min_delta
+
+
+def format_metric_value(value: float, precision: int = 4) -> str:
+    if not math.isfinite(value):
+        return "nan"
+    return f"{value:.{precision}f}"
+
+
+def print_split_metrics(split_name: str, metrics: dict[str, float]) -> None:
+    prefix = split_name
+    print(
+        f"  {split_name} -> "
+        f"L:{format_metric_value(metrics[f'{prefix}/loss'])} | "
+        f"PSNR:{format_metric_value(metrics[f'{prefix}/psnr'], precision=2)} | "
+        f"SSIM:{format_metric_value(metrics[f'{prefix}/ssim'])} | "
+        f"CC:{format_metric_value(metrics[f'{prefix}/cc'])} | "
+        f"ROI-L1:{format_metric_value(metrics[f'{prefix}/roi_l1'])} | "
+        f"ROI-SSIM:{format_metric_value(metrics[f'{prefix}/roi_ssim'])}"
+    )
+
+
+def sanitize_metrics_for_wandb(metrics: dict[str, float]) -> dict[str, float]:
+    sanitized: dict[str, float] = {}
+    for key, value in metrics.items():
+        if math.isfinite(value):
+            sanitized[key] = value
+    return sanitized
 
 
 def train_pipeline(cfg: dict) -> None:
@@ -565,8 +1135,8 @@ def train_pipeline(cfg: dict) -> None:
     device = get_best_device()
     print(f"🚀 Device: {device} | Output: {save_dir}")
 
-    train_loader, val_loader, case_splits = build_dataloaders(cfg, seed)
-    save_case_splits(save_dir, case_splits)
+    train_loader, val_loaders, split_info = build_dataloaders(cfg, seed)
+    save_case_splits(save_dir, split_info)
 
     model = get_model(cfg["model"]).to(device)
 
@@ -587,112 +1157,175 @@ def train_pipeline(cfg: dict) -> None:
     else:
         scheduler = None
 
+    roi_cfg = train_cfg.get("roi", {})
+    roi_margin = int(roi_cfg.get("margin", 6))
+    roi_mask_threshold = float(roi_cfg.get("mask_threshold", 0.5))
+
     l1_crit = nn.L1Loss()
+    roi_crit = ROILoss(mask_threshold=roi_mask_threshold)
     edge_crit = EdgeLoss(device)
     temporal_crit = TemporalDifferenceLoss()
 
-    loss_weights = train_cfg.get("loss_weights", {})
-    w_l1 = float(loss_weights.get("l1", 1.0))
-    w_edge = float(loss_weights.get("edge", 0.0))
-    w_temporal = float(loss_weights.get("temporal", 0.0))
+    raw_loss_weights = train_cfg.get("loss_weights", {})
+    loss_weights = {
+        "l1": float(raw_loss_weights.get("l1", 1.0)),
+        "roi": float(raw_loss_weights.get("roi", 0.0)),
+        "edge": float(raw_loss_weights.get("edge", 0.0)),
+        "temporal": float(raw_loss_weights.get("temporal", 0.0)),
+    }
 
-    tracker = MetricTracker()
-    best_ssim = -1.0
+    monitor_split, monitor_metric, monitor_mode = choose_monitor(train_cfg, val_loaders)
+    monitor_key = f"{monitor_split}/{monitor_metric}"
+    best_monitor_value: float | None = None
+    best_split_ssim: dict[str, float | None] = {split_name: None for split_name in val_loaders}
+
+    early_stop_cfg = train_cfg.get("early_stopping", {})
+    early_stop_enable = bool(early_stop_cfg.get("enable", False))
+    early_stop_patience = int(early_stop_cfg.get("patience", 30))
+    early_stop_min_delta = float(early_stop_cfg.get("min_delta", 0.0))
+    early_stop_bad_epochs = 0
 
     csv_file = save_dir / "results.csv"
+    csv_fields = [
+        "epoch",
+        "train/loss",
+        "train/lr",
+        "train/l1",
+        "train/roi",
+        "train/edge",
+        "train/temporal",
+    ]
+    for split_name in val_loaders:
+        csv_fields.extend(metric_fieldnames_for_prefix(split_name))
+    csv_fields.append("monitor/value")
+
     with open(csv_file, "w", encoding="utf-8", newline="") as file:
-        file.write("epoch,train_loss,val_loss,psnr,ssim,cc,rie\n")
+        writer = csv.DictWriter(file, fieldnames=csv_fields)
+        writer.writeheader()
 
     logging_cfg = cfg.get("logging", {})
     save_freq = int(logging_cfg.get("save_freq", 10))
     epochs = int(train_cfg["epochs"])
 
+    print(
+        f"🎯 Monitor: {monitor_key} ({monitor_mode}) | "
+        f"LossWeights: l1={loss_weights['l1']}, roi={loss_weights['roi']}, "
+        f"edge={loss_weights['edge']}, temporal={loss_weights['temporal']}"
+    )
+
     for epoch in range(1, epochs + 1):
         model.train()
         train_loss_acc = 0.0
+        train_part_acc = {"l1": 0.0, "roi": 0.0, "edge": 0.0, "temporal": 0.0}
         pbar = tqdm(train_loader, desc=f"Ep {epoch}/{epochs}", unit="bt")
 
         for batch in pbar:
-            model_inputs, targets, _, _ = prepare_batch(batch, device)
+            model_inputs, targets, _, _, extras = prepare_batch(batch, device)
+            mask = extras.get("mask")
 
             optimizer.zero_grad(set_to_none=True)
             preds = forward_model(model, model_inputs)
-
-            loss = w_l1 * l1_crit(preds, targets)
-            if w_edge > 0:
-                loss = loss + w_edge * edge_crit(preds, targets)
-            if w_temporal > 0:
-                loss = loss + w_temporal * temporal_crit(preds, targets)
+            loss, loss_parts = compute_loss(
+                preds=preds,
+                targets=targets,
+                mask=mask,
+                l1_crit=l1_crit,
+                roi_crit=roi_crit,
+                edge_crit=edge_crit,
+                temporal_crit=temporal_crit,
+                loss_weights=loss_weights,
+            )
 
             loss.backward()
             optimizer.step()
 
             train_loss_acc += loss.item()
+            for name in train_part_acc:
+                train_part_acc[name] += float(loss_parts[name].item())
             pbar.set_postfix({"L": f"{loss.item():.4f}"})
 
         train_loss_avg = train_loss_acc / max(len(train_loader), 1)
+        train_part_avg = {f"train/{name}": train_part_acc[name] / max(len(train_loader), 1) for name in train_part_acc}
         if scheduler is not None:
             scheduler.step()
 
-        model.eval()
-        tracker.reset()
-        with torch.no_grad():
-            for batch in val_loader:
-                model_inputs, targets, _, batch_size = prepare_batch(batch, device)
-                preds = forward_model(model, model_inputs)
-
-                v_loss = w_l1 * l1_crit(preds, targets)
-                if w_edge > 0:
-                    v_loss = v_loss + w_edge * edge_crit(preds, targets)
-                if w_temporal > 0:
-                    v_loss = v_loss + w_temporal * temporal_crit(preds, targets)
-
-                tracker.update(
-                    v_loss.item(),
-                    EITMetrics.psnr(preds, targets),
-                    EITMetrics.ssim(preds, targets),
-                    EITMetrics.cc(preds, targets),
-                    EITMetrics.rie(preds, targets),
-                    n=batch_size,
-                )
-
-        metrics = tracker.avg()
-        print(
-            f"  Valid -> "
-            f"L:{metrics['val/loss']:.4f} | "
-            f"PSNR:{metrics['val/psnr']:.2f} | "
-            f"SSIM:{metrics['val/ssim']:.4f} | "
-            f"CC:{metrics['val/cc']:.4f}"
-        )
-
-        with open(csv_file, "a", encoding="utf-8", newline="") as file:
-            file.write(
-                f"{epoch},{train_loss_avg},{metrics['val/loss']},"
-                f"{metrics['val/psnr']},{metrics['val/ssim']},"
-                f"{metrics['val/cc']},{metrics['val/rie']}\n"
+        eval_metrics: dict[str, float] = {}
+        for split_name, loader in val_loaders.items():
+            split_metrics = evaluate_loader(
+                model=model,
+                loader=loader,
+                device=device,
+                prefix=split_name,
+                l1_crit=l1_crit,
+                roi_crit=roi_crit,
+                edge_crit=edge_crit,
+                temporal_crit=temporal_crit,
+                loss_weights=loss_weights,
+                roi_margin=roi_margin,
+                roi_mask_threshold=roi_mask_threshold,
             )
+            eval_metrics.update(split_metrics)
+            print_split_metrics(split_name, split_metrics)
+
+        row = {
+            "epoch": epoch,
+            "train/loss": train_loss_avg,
+            "train/lr": optimizer.param_groups[0]["lr"],
+            **train_part_avg,
+            **eval_metrics,
+            "monitor/value": eval_metrics.get(monitor_key, float("nan")),
+        }
+        with open(csv_file, "a", encoding="utf-8", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=csv_fields)
+            writer.writerow(row)
+
+        primary_vis_loader = val_loaders.get(monitor_split)
+        if primary_vis_loader is None:
+            primary_vis_loader = next(iter(val_loaders.values()))
 
         wandb_images = None
         if epoch % save_freq == 0:
-            wandb_images = visualize_and_save(model, val_loader, device, save_dir, epoch)
+            wandb_images = visualize_and_save(model, primary_vis_loader, device, save_dir, epoch)
 
         if wandb_enabled:
             log_data = {
                 "train/loss": train_loss_avg,
                 "train/lr": optimizer.param_groups[0]["lr"],
-                **metrics,
+                **train_part_avg,
+                **sanitize_metrics_for_wandb(eval_metrics),
                 "epoch": epoch,
             }
             if wandb_images:
                 log_data["examples"] = wandb_images
             wandb.log(log_data)
 
-        if metrics["val/ssim"] > best_ssim:
-            best_ssim = metrics["val/ssim"]
-            torch.save(model.state_dict(), save_dir / "best_ssim.pth")
-            print("  🔥 Best SSIM Updated!")
+        for split_name in val_loaders:
+            split_ssim_key = f"{split_name}/ssim"
+            split_ssim = eval_metrics.get(split_ssim_key, float("nan"))
+            if is_improved(split_ssim, best_split_ssim[split_name], mode="max", min_delta=0.0):
+                best_split_ssim[split_name] = split_ssim
+                torch.save(model.state_dict(), save_dir / f"best_{split_name}_ssim.pth")
+                print(f"  🔥 Best {split_name} SSIM Updated!")
+
+        current_monitor = eval_metrics.get(monitor_key, float("nan"))
+        if is_improved(current_monitor, best_monitor_value, mode=monitor_mode, min_delta=early_stop_min_delta):
+            best_monitor_value = current_monitor
+            early_stop_bad_epochs = 0
+            torch.save(model.state_dict(), save_dir / "best.pth")
+            if monitor_metric == "ssim":
+                torch.save(model.state_dict(), save_dir / "best_ssim.pth")
+            print(f"  ✅ Monitor Improved: {monitor_key}={format_metric_value(current_monitor)}")
+        else:
+            early_stop_bad_epochs += 1
 
         torch.save(model.state_dict(), save_dir / "last.pth")
+
+        if early_stop_enable and early_stop_bad_epochs >= early_stop_patience:
+            print(
+                f"⏹️ Early stopping triggered at epoch {epoch} | "
+                f"monitor={monitor_key}, patience={early_stop_patience}"
+            )
+            break
 
     if wandb_enabled:
         wandb.finish()
