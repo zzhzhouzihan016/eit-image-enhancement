@@ -1,6 +1,6 @@
 # ================= 实验基本信息 =================
-experiment_name: "exp101_dual_source_seq_unet"
-save_dir: "outputs/experiments/exp101_dual_source_seq_unet_run1"
+experiment_name: "exp104_dual_source_seq_unet_normfix"
+save_dir: "outputs/experiments/exp104_dual_source_seq_unet_normfix_run1"
 seed: 42
 
 # ================= 数据集配置 =================
@@ -112,5 +112,5 @@ wandb:
   entity: null
   # 如果你想只在本地记录，取消下一行注释：
   # mode: "offline"
-  name: "Exp101_Dual_Source_Seq_UNet_run1"
-  tags: ["dual_source", "20frames", "jac32_to_gt64"]
+  name: "Exp104_Dual_Source_Seq_UNet_NormFix_run1"
+  tags: ["dual_source", "20frames", "jac32_to_gt64", "normalization_fix", "safe_modulation"]

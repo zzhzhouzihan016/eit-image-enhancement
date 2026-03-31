@@ -5,6 +5,12 @@ import torch.nn.functional as F
 from .parts import DoubleConv, Down, OutConv, Up
 
 
+def _zero_init_linear(linear: nn.Linear) -> None:
+    nn.init.zeros_(linear.weight)
+    if linear.bias is not None:
+        nn.init.zeros_(linear.bias)
+
+
 class DualSourceSeqUNet(nn.Module):
     """
     最小双输入 baseline：
@@ -46,6 +52,9 @@ class DualSourceSeqUNet(nn.Module):
         self.voltage_gate = nn.Linear(voltage_hidden, 1)
         self.voltage_bias = nn.Linear(voltage_hidden, 1)
         self.voltage_map = nn.Linear(voltage_hidden, 1)
+        _zero_init_linear(self.voltage_gate)
+        _zero_init_linear(self.voltage_bias)
+        _zero_init_linear(self.voltage_map)
 
         in_channels = 2 * n_frames
 
@@ -79,7 +88,8 @@ class DualSourceSeqUNet(nn.Module):
         voltage_embed = self.voltage_encoder(voltage.reshape(batch_size * num_frames, self.voltage_dim))
         voltage_embed = voltage_embed.view(batch_size, num_frames, -1)
 
-        gate = torch.sigmoid(self.voltage_gate(voltage_embed)).view(batch_size, num_frames, 1, 1)
+        # Bound gate around 0 so zero-initialized heads keep the original recon unchanged at startup.
+        gate = (0.5 * torch.tanh(self.voltage_gate(voltage_embed))).view(batch_size, num_frames, 1, 1)
         bias = self.voltage_bias(voltage_embed).view(batch_size, num_frames, 1, 1)
         voltage_map = self.voltage_map(voltage_embed).view(batch_size, num_frames, 1, 1)
         voltage_map = voltage_map.expand(-1, -1, height, width)

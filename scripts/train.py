@@ -1,5 +1,6 @@
 import argparse
 import csv
+import hashlib
 import math
 import random
 import sys
@@ -422,6 +423,33 @@ class TensorNoiseScaleAugment:
         return out
 
 
+class TensorStandardizeTransform:
+    def __init__(self, mean: Any, std: Any, eps: float = 1e-6) -> None:
+        self.mean = torch.as_tensor(mean, dtype=torch.float32)
+        self.std = torch.clamp(torch.as_tensor(std, dtype=torch.float32), min=float(eps))
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        mean = self.mean.to(device=tensor.device, dtype=tensor.dtype)
+        std = self.std.to(device=tensor.device, dtype=tensor.dtype)
+
+        while mean.ndim < tensor.ndim:
+            mean = mean.unsqueeze(0)
+            std = std.unsqueeze(0)
+
+        return (tensor - mean) / std
+
+
+class TensorTransformPipeline:
+    def __init__(self, *transforms) -> None:
+        self.transforms = [transform for transform in transforms if transform is not None]
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        out = tensor
+        for transform in self.transforms:
+            out = transform(out)
+        return out
+
+
 def parse_scale_range(value: Any, default: tuple[float, float] = (1.0, 1.0)) -> tuple[float, float]:
     if value is None:
         return default
@@ -431,6 +459,199 @@ def parse_scale_range(value: Any, default: tuple[float, float] = (1.0, 1.0)) -> 
     if isinstance(value, (list, tuple)) and len(value) == 2:
         return float(value[0]), float(value[1])
     raise ValueError("scale_range 需要是标量或长度为 2 的列表/元组。")
+
+
+def compose_tensor_transforms(*transforms):
+    pipeline = TensorTransformPipeline(*transforms)
+    return pipeline if pipeline.transforms else None
+
+
+def resolve_noise_indices(noise_mode: str, fixed_noise_index: int, noise_indices) -> tuple[int, ...]:
+    if noise_mode == "fixed":
+        return (int(fixed_noise_index),)
+    if noise_mode == "expand":
+        if noise_indices is None:
+            return (0, 1, 2, 3, 4)
+        return tuple(int(index) for index in noise_indices)
+    raise ValueError("noise_mode 仅支持 'fixed' 或 'expand'。")
+
+
+def select_records_by_keys(records, record_keys: list[str] | None):
+    if record_keys is None:
+        return list(records)
+
+    allowed_keys = set(record_keys)
+    return [
+        record
+        for record in records
+        if build_record_key(record.case_id, record.slice_index, record.sample_name) in allowed_keys
+    ]
+
+
+def build_normalization_cache_path(
+    dataset_root: Path,
+    dataset_label: str,
+    manifest_name: str,
+    records,
+    noise_indices: tuple[int, ...],
+) -> Path:
+    cache_dir = dataset_root / "normalization_cache"
+    record_keys = sorted(build_record_key(record.case_id, record.slice_index, record.sample_name) for record in records)
+    digest_source = "\n".join(record_keys).encode("utf-8")
+    record_digest = hashlib.sha1(digest_source).hexdigest()[:12]
+    manifest_stem = Path(manifest_name).stem
+    noise_signature = "-".join(str(index) for index in noise_indices)
+    filename = f"{dataset_label}_{manifest_stem}_{record_digest}_noise_{noise_signature}.npz"
+    return cache_dir / filename
+
+
+def compute_lctsc_input_stats(
+    records,
+    noise_indices: tuple[int, ...],
+    include_voltage: bool,
+    cache_path: Path | None = None,
+) -> dict[str, np.ndarray]:
+    if cache_path is not None and cache_path.exists():
+        with np.load(cache_path, allow_pickle=False) as cached:
+            stats = {key: cached[key] for key in cached.files}
+        print(f"📐 Loaded normalization stats from cache: {cache_path}")
+        return stats
+
+    if not records:
+        raise ValueError("计算标准化统计量时没有可用训练记录。")
+
+    recon_sum = 0.0
+    recon_sq_sum = 0.0
+    recon_count = 0
+
+    voltage_sum = None
+    voltage_sq_sum = None
+    voltage_count = 0
+
+    for record in records:
+        with np.load(record.npz_path, allow_pickle=False) as loaded:
+            recon_all = loaded["input_recon"]
+            voltage_all = loaded["valid208_voltage_noisy"] if include_voltage else None
+
+            for noise_index in noise_indices:
+                recon = np.asarray(recon_all[noise_index], dtype=np.float64)
+                recon_sum += float(recon.sum())
+                recon_sq_sum += float(np.square(recon).sum())
+                recon_count += int(recon.size)
+
+                if include_voltage:
+                    voltage = np.asarray(voltage_all[noise_index], dtype=np.float64)
+                    voltage_flat = voltage.reshape(-1, voltage.shape[-1])
+                    if voltage_sum is None:
+                        voltage_sum = np.zeros(voltage_flat.shape[-1], dtype=np.float64)
+                        voltage_sq_sum = np.zeros(voltage_flat.shape[-1], dtype=np.float64)
+                    voltage_sum += voltage_flat.sum(axis=0)
+                    voltage_sq_sum += np.square(voltage_flat).sum(axis=0)
+                    voltage_count += int(voltage_flat.shape[0])
+
+    recon_mean = np.asarray(recon_sum / max(recon_count, 1), dtype=np.float32)
+    recon_var = max(recon_sq_sum / max(recon_count, 1) - float(recon_mean) ** 2, 1e-12)
+    recon_std = np.asarray(math.sqrt(recon_var), dtype=np.float32)
+
+    stats: dict[str, np.ndarray] = {
+        "recon_mean": recon_mean,
+        "recon_std": recon_std,
+    }
+
+    if include_voltage:
+        if voltage_sum is None or voltage_sq_sum is None:
+            raise ValueError("期望计算 voltage 标准化统计量，但未收集到任何 voltage 数据。")
+        voltage_mean = voltage_sum / max(voltage_count, 1)
+        voltage_var = np.maximum(voltage_sq_sum / max(voltage_count, 1) - np.square(voltage_mean), 1e-12)
+        stats["voltage_mean"] = voltage_mean.astype(np.float32)
+        stats["voltage_std"] = np.sqrt(voltage_var).astype(np.float32)
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(cache_path, **stats)
+        print(f"📐 Saved normalization stats to cache: {cache_path}")
+
+    return stats
+
+
+def build_lctsc_normalization_transforms(
+    data_cfg: dict,
+    dataset_cls,
+    manifest_name: str,
+    records,
+    record_keys: list[str] | None,
+    noise_mode: str,
+    fixed_noise_index: int,
+    noise_indices,
+):
+    norm_cfg = data_cfg.get("normalization", {})
+    if not bool(norm_cfg.get("enable", False)):
+        return None, None, {"enabled": False}
+
+    strategy = str(norm_cfg.get("strategy", "train_split")).lower()
+    if strategy != "train_split":
+        raise ValueError("当前 normalization.strategy 仅支持 'train_split'。")
+
+    dataset_root = Path(data_cfg["dataset_root"])
+    if not dataset_root.is_absolute():
+        dataset_root = PROJECT_ROOT / dataset_root
+
+    selected_records = select_records_by_keys(records, record_keys)
+    selected_noise_indices = resolve_noise_indices(noise_mode, fixed_noise_index, noise_indices)
+    include_voltage = dataset_cls is LCTSCDualSourceDataset
+
+    cache_path = None
+    if bool(norm_cfg.get("cache", True)):
+        dataset_label = "dual_source" if include_voltage else "recon_only"
+        cache_path = build_normalization_cache_path(
+            dataset_root=dataset_root,
+            dataset_label=dataset_label,
+            manifest_name=manifest_name,
+            records=selected_records,
+            noise_indices=selected_noise_indices,
+        )
+
+    print(
+        "📐 Computing normalization stats: "
+        f"records={len(selected_records)}, noise_indices={list(selected_noise_indices)}, "
+        f"include_voltage={include_voltage}"
+    )
+    stats = compute_lctsc_input_stats(
+        records=selected_records,
+        noise_indices=selected_noise_indices,
+        include_voltage=include_voltage,
+        cache_path=cache_path,
+    )
+
+    recon_transform = TensorStandardizeTransform(stats["recon_mean"], stats["recon_std"])
+    voltage_transform = None
+    if include_voltage:
+        voltage_transform = TensorStandardizeTransform(stats["voltage_mean"], stats["voltage_std"])
+
+    summary = {
+        "enabled": True,
+        "strategy": strategy,
+        "cache_path": str(cache_path) if cache_path is not None else "",
+        "record_count": len(selected_records),
+        "noise_indices": list(selected_noise_indices),
+        "recon_mean": float(np.asarray(stats["recon_mean"]).item()),
+        "recon_std": float(np.asarray(stats["recon_std"]).item()),
+    }
+    if include_voltage:
+        summary["voltage_mean_avg"] = float(np.mean(stats["voltage_mean"]))
+        summary["voltage_std_avg"] = float(np.mean(stats["voltage_std"]))
+
+    print(
+        "📐 Normalization summary: "
+        f"recon_mean={summary['recon_mean']:.6e}, recon_std={summary['recon_std']:.6e}"
+        + (
+            f", voltage_std_avg={summary['voltage_std_avg']:.6e}"
+            if include_voltage
+            else ""
+        )
+    )
+
+    return recon_transform, voltage_transform, summary
 
 
 def build_lctsc_augmentation_transforms(data_cfg: dict, dataset_cls):
@@ -724,8 +945,6 @@ def _build_lctsc_sequence_dataloaders(cfg: dict, seed: int, dataset_cls, dataset
     fixed_noise_index = int(noise_cfg.get("fixed_index", 2))
     noise_indices = noise_cfg.get("indices")
 
-    train_recon_transform, train_voltage_transform = build_lctsc_augmentation_transforms(data_cfg, dataset_cls)
-
     probe_train_ds = dataset_cls(
         **_build_dataset_kwargs(
             dataset_cls=dataset_cls,
@@ -750,6 +969,23 @@ def _build_lctsc_sequence_dataloaders(cfg: dict, seed: int, dataset_cls, dataset
     )
 
     train_record_keys = intra_val_split["train_record_keys"] if intra_val_split["enabled"] else None
+    norm_recon_transform, norm_voltage_transform, normalization_info = build_lctsc_normalization_transforms(
+        data_cfg=data_cfg,
+        dataset_cls=dataset_cls,
+        manifest_name=manifest_name,
+        records=probe_train_ds.records,
+        record_keys=train_record_keys,
+        noise_mode=noise_mode,
+        fixed_noise_index=fixed_noise_index,
+        noise_indices=noise_indices,
+    )
+
+    aug_recon_transform, aug_voltage_transform = build_lctsc_augmentation_transforms(data_cfg, dataset_cls)
+    train_recon_transform = compose_tensor_transforms(norm_recon_transform, aug_recon_transform)
+    train_voltage_transform = compose_tensor_transforms(norm_voltage_transform, aug_voltage_transform)
+    eval_recon_transform = norm_recon_transform
+    eval_voltage_transform = norm_voltage_transform
+
     train_ds = dataset_cls(
         **_build_dataset_kwargs(
             dataset_cls=dataset_cls,
@@ -782,6 +1018,8 @@ def _build_lctsc_sequence_dataloaders(cfg: dict, seed: int, dataset_cls, dataset
                 noise_mode=noise_mode,
                 fixed_noise_index=fixed_noise_index,
                 noise_indices=noise_indices,
+                recon_transform=eval_recon_transform,
+                voltage_transform=eval_voltage_transform,
             )
         )
         val_loaders["val_inter"] = DataLoader(val_inter_ds, shuffle=False, **loader_kwargs)
@@ -799,6 +1037,8 @@ def _build_lctsc_sequence_dataloaders(cfg: dict, seed: int, dataset_cls, dataset
                 noise_mode=noise_mode,
                 fixed_noise_index=fixed_noise_index,
                 noise_indices=noise_indices,
+                recon_transform=eval_recon_transform,
+                voltage_transform=eval_voltage_transform,
             )
         )
         val_loaders["val_intra"] = DataLoader(val_intra_ds, shuffle=False, **loader_kwargs)
@@ -827,6 +1067,7 @@ def _build_lctsc_sequence_dataloaders(cfg: dict, seed: int, dataset_cls, dataset
             "val_intra_record_count": len(intra_val_split["val_intra_record_keys"]),
             "val_intra_samples": len(val_intra_ds) if val_intra_ds is not None else 0,
         },
+        "normalization": normalization_info,
     }
 
     print(

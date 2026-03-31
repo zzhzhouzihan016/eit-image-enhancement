@@ -11,6 +11,11 @@ data:
   batch_size: 8
   num_workers: 4
 
+  normalization:
+    enable: true
+    strategy: "train_split"
+    cache: true
+
   augmentation:
     enable: true
     recon_noise_std: 0.01
