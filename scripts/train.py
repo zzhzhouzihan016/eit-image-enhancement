@@ -914,6 +914,7 @@ def _build_dataset_kwargs(
     noise_mode: str,
     fixed_noise_index: int,
     noise_indices,
+    mask_key: str,
     recon_transform=None,
     voltage_transform=None,
     record_keys: list[str] | None = None,
@@ -926,6 +927,7 @@ def _build_dataset_kwargs(
         "noise_mode": noise_mode,
         "fixed_noise_index": fixed_noise_index,
         "noise_indices": noise_indices,
+        "mask_key": mask_key,
         "recon_transform": recon_transform,
     }
     if dataset_cls is LCTSCDualSourceDataset:
@@ -938,6 +940,7 @@ def _build_lctsc_sequence_dataloaders(cfg: dict, seed: int, dataset_cls, dataset
     batch_size = int(data_cfg["batch_size"])
     num_workers = int(data_cfg.get("num_workers", 4))
     dataset_root = data_cfg["dataset_root"]
+    mask_key = str(data_cfg.get("mask_key", "target_pathology_mask"))
     manifest_name, case_splits = _resolve_lctsc_case_splits(data_cfg, seed)
 
     noise_cfg = data_cfg.get("noise", {})
@@ -954,6 +957,7 @@ def _build_lctsc_sequence_dataloaders(cfg: dict, seed: int, dataset_cls, dataset
             noise_mode=noise_mode,
             fixed_noise_index=fixed_noise_index,
             noise_indices=noise_indices,
+            mask_key=mask_key,
         )
     )
 
@@ -996,6 +1000,7 @@ def _build_lctsc_sequence_dataloaders(cfg: dict, seed: int, dataset_cls, dataset
             noise_mode=noise_mode,
             fixed_noise_index=fixed_noise_index,
             noise_indices=noise_indices,
+            mask_key=mask_key,
             recon_transform=train_recon_transform,
             voltage_transform=train_voltage_transform,
         )
@@ -1018,6 +1023,7 @@ def _build_lctsc_sequence_dataloaders(cfg: dict, seed: int, dataset_cls, dataset
                 noise_mode=noise_mode,
                 fixed_noise_index=fixed_noise_index,
                 noise_indices=noise_indices,
+                mask_key=mask_key,
                 recon_transform=eval_recon_transform,
                 voltage_transform=eval_voltage_transform,
             )
@@ -1037,6 +1043,7 @@ def _build_lctsc_sequence_dataloaders(cfg: dict, seed: int, dataset_cls, dataset
                 noise_mode=noise_mode,
                 fixed_noise_index=fixed_noise_index,
                 noise_indices=noise_indices,
+                mask_key=mask_key,
                 recon_transform=eval_recon_transform,
                 voltage_transform=eval_voltage_transform,
             )
@@ -1055,6 +1062,7 @@ def _build_lctsc_sequence_dataloaders(cfg: dict, seed: int, dataset_cls, dataset
         "train_cases": case_splits["train"],
         "val_inter_cases": case_splits["val_inter"],
         "test_cases": case_splits["test"],
+        "mask_key": mask_key,
         "train_samples": len(train_ds),
         "val_inter_samples": len(val_inter_ds) if val_inter_ds is not None else 0,
         "val_intra": {

@@ -1,0 +1,115 @@
+# ================= 实验基本信息 =================
+experiment_name: "exp105_dual_source_seq_unet_lung_contour_roi"
+save_dir: "outputs/experiments/exp105_dual_source_seq_unet_lung_contour_roi_run1"
+seed: 42
+
+# ================= 数据集配置 =================
+data:
+  dataset_type: "dual_source_lctsc"
+  dataset_root: "data/processed/train_sim/lctsc_cem_pathology_jac32_gt64"
+  manifest_name: "global_samples_manifest.csv"
+  mask_key: "target_lung_contour_mask"
+  batch_size: 8
+  num_workers: 4
+
+  normalization:
+    enable: true
+    strategy: "train_split"
+    cache: true
+
+  augmentation:
+    enable: true
+    recon_noise_std: 0.01
+    recon_scale_range: [0.98, 1.02]
+    voltage_noise_std: 0.002
+    voltage_scale_range: [0.99, 1.01]
+    voltage_dropout_prob: 0.01
+
+  intra_val:
+    enable: true
+    ratio: 0.12
+    group_by: "slice"
+    seed: 42
+
+  noise:
+    mode: "fixed"
+    fixed_index: 2
+
+  case_split:
+    train_case_ids:
+      - "LCTSC-Train-S3-010"
+      - "LCTSC-Test-S1-204"
+      - "LCTSC-Test-S1-201"
+      - "LCTSC-Train-S1-012"
+      - "LCTSC-Test-S2-203"
+      - "LCTSC-Train-S1-007"
+      - "LCTSC-Train-S2-001"
+      - "LCTSC-Train-S3-005"
+      - "LCTSC-Test-S2-101"
+      - "LCTSC-Train-S1-008"
+      - "LCTSC-Train-S2-012"
+      - "LCTSC-Train-S1-010"
+      - "LCTSC-Train-S1-001"
+      - "LCTSC-Test-S1-104"
+      - "LCTSC-Train-S1-005"
+    val_case_ids:
+      - "LCTSC-Test-S1-203"
+      - "LCTSC-Train-S2-007"
+      - "LCTSC-Test-S2-102"
+    test_case_ids:
+      - "LCTSC-Test-S2-104"
+      - "LCTSC-Test-S1-102"
+      - "LCTSC-Test-S1-202"
+      - "LCTSC-Train-S3-008"
+
+# ================= 模型配置 =================
+model:
+  name: "dual_source_seq_unet"
+  params:
+    n_frames: 20
+    voltage_dim: 208
+    out_frames: 20
+    bilinear: True
+    base_channels: 32
+    voltage_hidden: 64
+    output_size: [64, 64]
+
+# ================= 训练超参数 =================
+train:
+  epochs: 300
+  learning_rate: 0.0001
+  weight_decay: 1e-5
+  optimizer: "AdamW"
+  scheduler: "CosineAnnealingLR"
+
+  loss_weights:
+    l1: 1.0
+    roi: 0.5
+    edge: 0.2
+    temporal: 0.1
+
+  roi:
+    margin: 6
+    mask_threshold: 0.5
+
+  monitor_split: "val_inter"
+  monitor_metric: "ssim"
+  monitor_mode: "max"
+
+  early_stopping:
+    enable: true
+    patience: 60
+    min_delta: 0.0
+
+logging:
+  save_freq: 5
+  val_freq: 1
+  print_freq: 10
+
+# ================= WandB 配置 =================
+wandb:
+  enable: True
+  project: "EIT_Enhancement"
+  entity: null
+  name: "Exp105_Dual_Source_Seq_UNet_LungContourROI_run1"
+  tags: ["dual_source", "20frames", "jac32_to_gt64", "lung_contour_roi", "normalization_fix"]
