@@ -1,0 +1,78 @@
+# ================= 实验基本信息 =================
+experiment_name: "exp107_structeit_baseline_unet_smoke"
+save_dir: "outputs/experiments/exp107_structeit_baseline_unet_smoke"
+seed: 42
+
+# ================= 数据集配置 =================
+data:
+  dataset_type: "structeit_single_source"
+  dataset_root: "data/processed/train_sim/struct_eit"
+  input_key: "greit_img"
+  target_key: "target_img"
+  window_size: 1
+  target_mode: "middle"
+  batch_size: 8
+  num_workers: 0
+
+  normalization:
+    enable: true
+    strategy: "train_split"
+    cache: true
+
+  foreground_mask:
+    enable: true
+    threshold_abs: 1.0e-6
+
+  augmentation:
+    enable: false
+
+  case_split:
+    train_ratio: 0.7
+    val_ratio: 0.15
+    debug_limit_per_source:
+      train: 8
+      val: 2
+      test: 2
+
+# ================= 模型配置 =================
+model:
+  name: "st_unet"
+  params:
+    n_frames: 1
+    n_classes: 1
+    bilinear: true
+
+# ================= 训练超参数 =================
+train:
+  epochs: 3
+  learning_rate: 0.0001
+  weight_decay: 1e-5
+  optimizer: "AdamW"
+  scheduler: "CosineAnnealingLR"
+
+  loss_weights:
+    l1: 1.0
+    roi: 0.0
+    edge: 0.1
+    temporal: 0.0
+
+  monitor_split: "val"
+  monitor_metric: "ssim"
+  monitor_mode: "max"
+
+  early_stopping:
+    enable: false
+    patience: 8
+    min_delta: 0.0
+
+logging:
+  save_freq: 1
+  val_freq: 1
+  print_freq: 10
+
+wandb:
+  enable: false
+  project: "EIT_Enhancement"
+  entity: null
+  name: "Exp107_StructEIT_Baseline_UNet_smoke"
+  tags: ["structeit", "baseline", "smoke", "m4", "unet"]

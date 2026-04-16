@@ -35,6 +35,12 @@ from eit.dataset_dual_source import (
     build_record_key,
     build_slice_group_key,
 )
+from eit.dataset_structeit import (
+    StructEITSequenceDataset,
+    discover_structeit_records,
+    limit_case_ids_per_source,
+    split_structeit_case_ids,
+)
 from eit.models import get_model
 from eit.utils.seed import set_seed
 
@@ -93,6 +99,8 @@ def to_uint8_image(frame: torch.Tensor, value_range: tuple[float, float] | None 
 
 def forward_model(model: nn.Module, model_inputs):
     if isinstance(model_inputs, dict):
+        if set(model_inputs.keys()) == {"recon"}:
+            return model(model_inputs["recon"])
         return model(**model_inputs)
     return model(model_inputs)
 
@@ -160,6 +168,12 @@ def extract_roi_bounds(mask_2d: torch.Tensor, margin: int = 0, threshold: float 
 
 
 class EITMetrics:
+    @staticmethod
+    def rmse(preds: torch.Tensor, targets: torch.Tensor) -> float:
+        diff = preds.reshape(preds.shape[0], -1) - targets.reshape(targets.shape[0], -1)
+        mse = torch.mean(diff**2, dim=1)
+        return torch.mean(torch.sqrt(mse + 1e-8)).item()
+
     @staticmethod
     def psnr(preds: torch.Tensor, targets: torch.Tensor, data_range: float | None = None) -> float:
         p = preds.reshape(preds.shape[0], -1)
@@ -287,6 +301,7 @@ class MetricTracker:
 
     def reset(self) -> None:
         self.val_loss = 0.0
+        self.rmse = 0.0
         self.psnr = 0.0
         self.ssim = 0.0
         self.cc = 0.0
@@ -300,6 +315,7 @@ class MetricTracker:
     def update(
         self,
         loss: float,
+        rmse: float,
         p: float,
         s: float,
         c: float,
@@ -311,6 +327,7 @@ class MetricTracker:
         roi_n: int = 0,
     ) -> None:
         self.val_loss += loss * n
+        self.rmse += rmse * n
         self.psnr += p * n
         self.ssim += s * n
         self.cc += c * n
@@ -326,6 +343,7 @@ class MetricTracker:
     def avg(self) -> dict[str, float]:
         metrics = {
             f"{self.prefix}/loss": self.val_loss / self.count,
+            f"{self.prefix}/rmse": self.rmse / self.count,
             f"{self.prefix}/psnr": self.psnr / self.count,
             f"{self.prefix}/ssim": self.ssim / self.count,
             f"{self.prefix}/cc": self.cc / self.count,
@@ -676,6 +694,240 @@ def build_lctsc_augmentation_transforms(data_cfg: dict, dataset_cls):
     return recon_transform, voltage_transform
 
 
+def build_structeit_normalization_cache_path(
+    dataset_root: Path,
+    input_key: str,
+    records,
+) -> Path:
+    cache_dir = dataset_root / "normalization_cache"
+    record_digest = hashlib.sha1("\n".join(sorted(record.case_id for record in records)).encode("utf-8")).hexdigest()[:12]
+    filename = f"structeit_{input_key}_{record_digest}.npz"
+    return cache_dir / filename
+
+
+def compute_structeit_input_stats(
+    records,
+    input_key: str,
+    cache_path: Path | None = None,
+) -> dict[str, np.ndarray]:
+    if cache_path is not None and cache_path.exists():
+        with np.load(cache_path, allow_pickle=False) as cached:
+            stats = {key: cached[key] for key in cached.files}
+        print(f"📐 Loaded StructEIT normalization stats from cache: {cache_path}")
+        return stats
+
+    if not records:
+        raise ValueError("计算 StructEIT 标准化统计量时没有可用训练记录。")
+
+    recon_sum = 0.0
+    recon_sq_sum = 0.0
+    recon_count = 0
+
+    for record in records:
+        with np.load(record.npz_path, allow_pickle=False) as loaded:
+            recon = np.asarray(loaded[input_key], dtype=np.float64)
+        recon_sum += float(recon.sum())
+        recon_sq_sum += float(np.square(recon).sum())
+        recon_count += int(recon.size)
+
+    recon_mean = np.asarray(recon_sum / max(recon_count, 1), dtype=np.float32)
+    recon_var = max(recon_sq_sum / max(recon_count, 1) - float(recon_mean) ** 2, 1e-12)
+    recon_std = np.asarray(math.sqrt(recon_var), dtype=np.float32)
+    stats = {
+        "recon_mean": recon_mean,
+        "recon_std": recon_std,
+    }
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(cache_path, **stats)
+        print(f"📐 Saved StructEIT normalization stats to cache: {cache_path}")
+
+    return stats
+
+
+def build_structeit_normalization_transform(data_cfg: dict, train_records, input_key: str):
+    norm_cfg = data_cfg.get("normalization", {})
+    if not bool(norm_cfg.get("enable", False)):
+        return None, {"enabled": False}
+
+    strategy = str(norm_cfg.get("strategy", "train_split")).lower()
+    if strategy != "train_split":
+        raise ValueError("当前 StructEIT normalization.strategy 仅支持 'train_split'。")
+
+    dataset_root = Path(data_cfg["dataset_root"])
+    if not dataset_root.is_absolute():
+        dataset_root = PROJECT_ROOT / dataset_root
+
+    cache_path = None
+    if bool(norm_cfg.get("cache", True)):
+        cache_path = build_structeit_normalization_cache_path(
+            dataset_root=dataset_root,
+            input_key=input_key,
+            records=train_records,
+        )
+
+    print(
+        "📐 Computing StructEIT normalization stats: "
+        f"records={len(train_records)}, input_key={input_key}"
+    )
+    stats = compute_structeit_input_stats(
+        records=train_records,
+        input_key=input_key,
+        cache_path=cache_path,
+    )
+
+    recon_transform = TensorStandardizeTransform(stats["recon_mean"], stats["recon_std"])
+    summary = {
+        "enabled": True,
+        "strategy": strategy,
+        "cache_path": str(cache_path) if cache_path is not None else "",
+        "record_count": len(train_records),
+        "recon_mean": float(np.asarray(stats["recon_mean"]).item()),
+        "recon_std": float(np.asarray(stats["recon_std"]).item()),
+    }
+    print(
+        "📐 StructEIT normalization summary: "
+        f"recon_mean={summary['recon_mean']:.6e}, recon_std={summary['recon_std']:.6e}"
+    )
+    return recon_transform, summary
+
+
+def _resolve_structeit_case_splits(data_cfg: dict, seed: int) -> dict[str, list[str]]:
+    case_split_cfg = data_cfg.get("case_split", {})
+    train_case_ids = case_split_cfg.get("train_case_ids")
+    val_case_ids = case_split_cfg.get("val_case_ids")
+    test_case_ids = case_split_cfg.get("test_case_ids")
+    input_key = str(data_cfg.get("input_key", "greit_img"))
+
+    if train_case_ids is None or val_case_ids is None:
+        records = discover_structeit_records(
+            dataset_root=data_cfg["dataset_root"],
+            input_key=input_key,
+        )
+        raw_splits = split_structeit_case_ids(
+            case_ids=[record.case_id for record in records],
+            train_ratio=float(case_split_cfg.get("train_ratio", 0.7)),
+            val_ratio=float(case_split_cfg.get("val_ratio", 0.15)),
+            seed=seed,
+        )
+        splits = {
+            "train": list(raw_splits["train"]),
+            "val": list(raw_splits["val"]),
+            "test": list(raw_splits["test"]),
+        }
+    else:
+        splits = {
+            "train": list(train_case_ids),
+            "val": list(val_case_ids),
+            "test": list(test_case_ids or []),
+        }
+
+    debug_limit_cfg = case_split_cfg.get("debug_limit_per_source")
+    if debug_limit_cfg is not None:
+        for split_name in ("train", "val", "test"):
+            if isinstance(debug_limit_cfg, dict):
+                split_limit = debug_limit_cfg.get(split_name)
+            else:
+                split_limit = debug_limit_cfg
+            if split_limit is not None:
+                splits[split_name] = limit_case_ids_per_source(splits[split_name], int(split_limit))
+
+    return splits
+
+
+def build_structeit_baseline_dataloaders(cfg: dict, seed: int):
+    data_cfg = cfg["data"]
+    batch_size = int(data_cfg["batch_size"])
+    num_workers = int(data_cfg.get("num_workers", 4))
+    dataset_root = data_cfg["dataset_root"]
+    input_key = str(data_cfg.get("input_key", "greit_img"))
+    target_key = str(data_cfg.get("target_key", "target_img"))
+    target_mode = str(data_cfg.get("target_mode", "middle"))
+    window_size = int(data_cfg.get("window_size", cfg["model"].get("params", {}).get("n_frames", 1)))
+    foreground_mask_cfg = data_cfg.get("foreground_mask", {})
+    include_mask = bool(foreground_mask_cfg.get("enable", True))
+    mask_threshold_abs = float(foreground_mask_cfg.get("threshold_abs", 1e-6))
+
+    case_splits = _resolve_structeit_case_splits(data_cfg, seed)
+    probe_train_ds = StructEITSequenceDataset(
+        dataset_root=dataset_root,
+        case_ids=case_splits["train"],
+        input_key=input_key,
+        target_key=target_key,
+        window_size=window_size,
+        target_mode=target_mode,
+        include_mask=include_mask,
+        mask_threshold_abs=mask_threshold_abs,
+    )
+
+    norm_recon_transform, normalization_info = build_structeit_normalization_transform(
+        data_cfg=data_cfg,
+        train_records=probe_train_ds.records,
+        input_key=input_key,
+    )
+    aug_recon_transform, _ = build_lctsc_augmentation_transforms(data_cfg, StructEITSequenceDataset)
+    train_recon_transform = compose_tensor_transforms(norm_recon_transform, aug_recon_transform)
+    eval_recon_transform = norm_recon_transform
+
+    train_ds = StructEITSequenceDataset(
+        dataset_root=dataset_root,
+        case_ids=case_splits["train"],
+        input_key=input_key,
+        target_key=target_key,
+        window_size=window_size,
+        target_mode=target_mode,
+        recon_transform=train_recon_transform,
+        include_mask=include_mask,
+        mask_threshold_abs=mask_threshold_abs,
+    )
+    val_ds = StructEITSequenceDataset(
+        dataset_root=dataset_root,
+        case_ids=case_splits["val"],
+        input_key=input_key,
+        target_key=target_key,
+        window_size=window_size,
+        target_mode=target_mode,
+        recon_transform=eval_recon_transform,
+        include_mask=include_mask,
+        mask_threshold_abs=mask_threshold_abs,
+    )
+
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    val_loaders = {"val": DataLoader(val_ds, shuffle=False, **loader_kwargs)}
+
+    split_info: dict[str, Any] = {
+        "split_mode": "structeit_case_split",
+        "train_cases": case_splits["train"],
+        "val_cases": case_splits["val"],
+        "test_cases": case_splits["test"],
+        "input_key": input_key,
+        "target_key": target_key,
+        "window_size": window_size,
+        "target_mode": target_mode,
+        "foreground_mask": {
+            "enable": include_mask,
+            "threshold_abs": mask_threshold_abs,
+        },
+        "train_samples": len(train_ds),
+        "val_samples": len(val_ds),
+        "normalization": normalization_info,
+    }
+
+    print(
+        "📊 StructEIT Split: "
+        f"TrainCases={len(case_splits['train'])}, ValCases={len(case_splits['val'])}, "
+        f"TestCases={len(case_splits['test'])} | "
+        f"TrainSamples={len(train_ds)}, ValSamples={len(val_ds)}"
+    )
+    return train_loader, val_loaders, split_info
+
+
 def inspect_single_source_npz(npz_path: str | Path, frames_per_seq_hint: int | None = None) -> tuple[int, int]:
     with np.load(npz_path, allow_pickle=False) as raw:
         if "input_data" in raw:
@@ -720,6 +972,7 @@ def build_single_source_dataloaders(cfg: dict, seed: int):
     img_h = int(data_cfg.get("img_size_h", 176))
     img_w = int(data_cfg.get("img_size_w", 256))
     n_frames = int(cfg["model"]["params"]["n_frames"])
+    target_mode = str(data_cfg.get("target_mode", "middle")).lower()
     batch_size = int(data_cfg["batch_size"])
     num_workers = int(data_cfg.get("num_workers", 4))
     val_ratio = float(data_cfg.get("val_ratio", 0.05))
@@ -738,7 +991,7 @@ def build_single_source_dataloaders(cfg: dict, seed: int):
     print(
         "🔧 Single-source Dataset Config: "
         f"samples={num_samples}, frames_per_seq={frames_per_seq}, size=({img_h}, {img_w}), "
-        f"val_ratio={val_ratio:.2f}"
+        f"val_ratio={val_ratio:.2f}, target_mode={target_mode}"
     )
 
     if num_samples < 2:
@@ -760,6 +1013,7 @@ def build_single_source_dataloaders(cfg: dict, seed: int):
         train_path,
         n_frames=n_frames,
         frames_per_seq=frames_per_seq,
+        target_mode=target_mode,
         target_size=(img_h, img_w),
         use_augmentation=use_augmentation,
         sample_ids=train_sample_ids,
@@ -774,6 +1028,7 @@ def build_single_source_dataloaders(cfg: dict, seed: int):
         train_path,
         n_frames=n_frames,
         frames_per_seq=frames_per_seq,
+        target_mode=target_mode,
         target_size=(img_h, img_w),
         use_augmentation=False,
         sample_ids=val_sample_ids,
@@ -797,6 +1052,7 @@ def build_single_source_dataloaders(cfg: dict, seed: int):
         "split_mode": "single_sequence",
         "train_sequence_ids": train_sample_ids,
         "val_sequence_ids": val_sample_ids,
+        "target_mode": target_mode,
     }
     return train_loader, {"val": val_loader}, split_info
 
@@ -1121,6 +1377,8 @@ def build_dataloaders(cfg: dict, seed: int):
         return build_dual_source_dataloaders(cfg, seed)
     if dataset_type == "single_source_lctsc_seq":
         return build_recon_sequence_dataloaders(cfg, seed)
+    if dataset_type == "structeit_single_source":
+        return build_structeit_baseline_dataloaders(cfg, seed)
     return build_single_source_dataloaders(cfg, seed)
 
 
@@ -1287,6 +1545,7 @@ def evaluate_loader(
 
             tracker.update(
                 val_loss.item(),
+                EITMetrics.rmse(preds, targets),
                 EITMetrics.psnr(preds, targets),
                 EITMetrics.ssim(preds, targets),
                 EITMetrics.cc(preds, targets),
@@ -1304,6 +1563,7 @@ def evaluate_loader(
 def metric_fieldnames_for_prefix(prefix: str) -> list[str]:
     return [
         f"{prefix}/loss",
+        f"{prefix}/rmse",
         f"{prefix}/psnr",
         f"{prefix}/ssim",
         f"{prefix}/cc",
@@ -1322,10 +1582,10 @@ def choose_monitor(train_cfg: dict, val_loaders: dict[str, DataLoader]) -> tuple
         raise ValueError(f"monitor_split={monitor_split} 不存在，可选值: {list(val_loaders.keys())}")
 
     monitor_metric = str(train_cfg.get("monitor_metric", "ssim"))
-    if monitor_metric not in {"loss", "psnr", "ssim", "cc", "rie", "roi_l1", "roi_psnr", "roi_ssim"}:
+    if monitor_metric not in {"loss", "rmse", "psnr", "ssim", "cc", "rie", "roi_l1", "roi_psnr", "roi_ssim"}:
         raise ValueError(
             "monitor_metric 仅支持 "
-            "{'loss', 'psnr', 'ssim', 'cc', 'rie', 'roi_l1', 'roi_psnr', 'roi_ssim'}。"
+            "{'loss', 'rmse', 'psnr', 'ssim', 'cc', 'rie', 'roi_l1', 'roi_psnr', 'roi_ssim'}。"
         )
     monitor_mode = str(train_cfg.get("monitor_mode", "max")).lower()
     if monitor_mode not in {"max", "min"}:
@@ -1355,6 +1615,7 @@ def print_split_metrics(split_name: str, metrics: dict[str, float]) -> None:
     print(
         f"  {split_name} -> "
         f"L:{format_metric_value(metrics[f'{prefix}/loss'])} | "
+        f"RMSE:{format_metric_value(metrics[f'{prefix}/rmse'])} | "
         f"PSNR:{format_metric_value(metrics[f'{prefix}/psnr'], precision=2)} | "
         f"SSIM:{format_metric_value(metrics[f'{prefix}/ssim'])} | "
         f"CC:{format_metric_value(metrics[f'{prefix}/cc'])} | "
