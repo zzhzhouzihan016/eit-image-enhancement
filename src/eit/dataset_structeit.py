@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import ast
+import bisect
+import json
 import random
 import struct
 import zipfile
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -16,6 +19,7 @@ from .utils.paths import resolve_from_root
 
 
 DEFAULT_DATASET_ROOT = "data/processed/train_sim/struct_eit"
+DEFAULT_CACHE_ROOT = "data/cache/structeit_baseline_stride2"
 
 
 @dataclass(frozen=True)
@@ -29,6 +33,12 @@ class StructEITRecord:
 def resolve_structeit_dataset_root(path_like: str | Path | None = None) -> Path:
     if path_like is None:
         return resolve_from_root(DEFAULT_DATASET_ROOT)
+    return resolve_from_root(path_like)
+
+
+def resolve_structeit_cache_root(path_like: str | Path | None = None) -> Path:
+    if path_like is None:
+        return resolve_from_root(DEFAULT_CACHE_ROOT)
     return resolve_from_root(path_like)
 
 
@@ -294,4 +304,112 @@ class StructEITSequenceDataset(Dataset):
                 "mask_threshold_abs": float(self.mask_threshold_abs),
             }
 
+        return sample
+
+
+class StructEITCacheDataset(Dataset):
+    """
+    读取 StructEIT 训练缓存（按 shard 分片）的 Dataset。
+
+    每个 worker 默认只缓存最近访问的 1 个 shard，
+    避免频繁 `np.load()` 原始 case 文件。
+    """
+
+    def __init__(
+        self,
+        cache_root: str | Path | None = None,
+        split: str = "train",
+        recon_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        target_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        return_meta: bool = True,
+        cache_size: int = 1,
+    ) -> None:
+        super().__init__()
+
+        if cache_size <= 0:
+            raise ValueError("cache_size 必须是正整数。")
+
+        self.cache_root = resolve_structeit_cache_root(cache_root)
+        self.split = str(split)
+        self.recon_transform = recon_transform
+        self.target_transform = target_transform
+        self.return_meta = return_meta
+        self.cache_size = int(cache_size)
+
+        self.split_dir = self.cache_root / self.split
+        self.metadata_path = self.split_dir / "metadata.json"
+        if not self.metadata_path.exists():
+            raise FileNotFoundError(f"找不到 StructEIT 缓存 split 元信息: {self.metadata_path}")
+
+        with open(self.metadata_path, "r", encoding="utf-8") as file:
+            self.metadata = json.load(file)
+
+        self.shards: list[dict[str, Any]] = list(self.metadata["shards"])
+        self.shard_sizes = [int(shard["num_samples"]) for shard in self.shards]
+        self.cumulative_sizes: list[int] = []
+        running = 0
+        for size in self.shard_sizes:
+            running += size
+            self.cumulative_sizes.append(running)
+
+        self._shard_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
+        self.num_samples = int(self.metadata["num_samples"])
+
+        if self.num_samples <= 0:
+            raise ValueError(f"{self.metadata_path} 中 num_samples 非法: {self.num_samples}")
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def _load_shard(self, shard_index: int) -> dict[str, Any]:
+        cached = self._shard_cache.get(shard_index)
+        if cached is not None:
+            self._shard_cache.move_to_end(shard_index)
+            return cached
+
+        shard_info = self.shards[shard_index]
+        shard_path = self.split_dir / shard_info["filename"]
+        payload = torch.load(shard_path, map_location="cpu")
+
+        self._shard_cache[shard_index] = payload
+        self._shard_cache.move_to_end(shard_index)
+        while len(self._shard_cache) > self.cache_size:
+            self._shard_cache.popitem(last=False)
+        return payload
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        if idx < 0:
+            idx += self.num_samples
+        if idx < 0 or idx >= self.num_samples:
+            raise IndexError(f"索引超出范围: idx={idx}, len={self.num_samples}")
+
+        shard_index = bisect.bisect_right(self.cumulative_sizes, idx)
+        shard_start = 0 if shard_index == 0 else self.cumulative_sizes[shard_index - 1]
+        local_index = idx - shard_start
+
+        shard_payload = self._load_shard(shard_index)
+        recon = shard_payload["recon"][local_index].clone()
+        target = shard_payload["target"][local_index].clone()
+        mask = shard_payload["mask"][local_index].clone()
+
+        if self.recon_transform is not None:
+            recon = self.recon_transform(recon)
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        sample: dict[str, Any] = {
+            "recon": recon,
+            "target": target,
+            "mask": mask,
+        }
+        if self.return_meta:
+            sample["meta"] = {
+                "case_id": shard_payload["case_ids"][local_index],
+                "source_group": shard_payload["source_groups"][local_index],
+                "window_start": int(shard_payload["window_starts"][local_index]),
+                "target_frame_index": int(shard_payload["target_frame_indices"][local_index]),
+                "split": self.split,
+                "shard_index": int(shard_index),
+                "local_index": int(local_index),
+            }
         return sample

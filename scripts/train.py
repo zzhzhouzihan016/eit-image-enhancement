@@ -2,6 +2,7 @@ import argparse
 from contextlib import nullcontext
 import csv
 import hashlib
+import json
 import math
 import random
 import sys
@@ -37,8 +38,10 @@ from eit.dataset_dual_source import (
     build_slice_group_key,
 )
 from eit.dataset_structeit import (
+    StructEITCacheDataset,
     StructEITSequenceDataset,
     discover_structeit_records,
+    resolve_structeit_cache_root,
     limit_case_ids_per_source,
     split_structeit_case_ids,
 )
@@ -940,6 +943,72 @@ def build_structeit_baseline_dataloaders(cfg: dict, seed: int):
     return train_loader, val_loaders, split_info
 
 
+def build_structeit_cached_dataloaders(cfg: dict, seed: int):
+    del seed
+    data_cfg = cfg["data"]
+    batch_size = int(data_cfg["batch_size"])
+    num_workers = int(data_cfg.get("num_workers", 4))
+    cache_root = resolve_structeit_cache_root(data_cfg["cache_root"])
+
+    global_metadata_path = cache_root / "cache_metadata.json"
+    if not global_metadata_path.exists():
+        raise FileNotFoundError(f"找不到 StructEIT 缓存元信息: {global_metadata_path}")
+
+    with open(global_metadata_path, "r", encoding="utf-8") as file:
+        global_metadata = json.load(file)
+
+    normalization = global_metadata.get("normalization") or {}
+    if not normalization:
+        raise ValueError(f"{global_metadata_path} 中缺少 normalization 信息。")
+
+    recon_transform = TensorStandardizeTransform(
+        normalization["recon_mean"],
+        normalization["recon_std"],
+    )
+    shard_cache_size = int(data_cfg.get("shard_cache_size", 1))
+
+    train_ds = StructEITCacheDataset(
+        cache_root=cache_root,
+        split="train",
+        recon_transform=recon_transform,
+        cache_size=shard_cache_size,
+    )
+    val_ds = StructEITCacheDataset(
+        cache_root=cache_root,
+        split="val",
+        recon_transform=recon_transform,
+        cache_size=shard_cache_size,
+    )
+
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(data_cfg.get("persistent_workers", True))
+        loader_kwargs["prefetch_factor"] = int(data_cfg.get("prefetch_factor", 4))
+
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    val_loaders = {"val": DataLoader(val_ds, shuffle=False, **loader_kwargs)}
+
+    split_info: dict[str, Any] = {
+        "split_mode": "structeit_cached",
+        "cache_root": str(cache_root),
+        "normalization": normalization,
+        "train_samples": len(train_ds),
+        "val_samples": len(val_ds),
+        "cache_metadata": global_metadata,
+    }
+
+    print(
+        "📦 StructEIT Cached Split: "
+        f"TrainSamples={len(train_ds)}, ValSamples={len(val_ds)} | "
+        f"batch={batch_size}, workers={num_workers}, shard_cache_size={shard_cache_size}"
+    )
+    return train_loader, val_loaders, split_info
+
+
 def inspect_single_source_npz(npz_path: str | Path, frames_per_seq_hint: int | None = None) -> tuple[int, int]:
     with np.load(npz_path, allow_pickle=False) as raw:
         if "input_data" in raw:
@@ -1391,6 +1460,8 @@ def build_dataloaders(cfg: dict, seed: int):
         return build_recon_sequence_dataloaders(cfg, seed)
     if dataset_type == "structeit_single_source":
         return build_structeit_baseline_dataloaders(cfg, seed)
+    if dataset_type == "structeit_cached":
+        return build_structeit_cached_dataloaders(cfg, seed)
     return build_single_source_dataloaders(cfg, seed)
 
 
