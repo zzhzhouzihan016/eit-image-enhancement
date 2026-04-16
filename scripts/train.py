@@ -1,4 +1,5 @@
 import argparse
+from contextlib import nullcontext
 import csv
 import hashlib
 import math
@@ -845,6 +846,8 @@ def build_structeit_baseline_dataloaders(cfg: dict, seed: int):
     target_key = str(data_cfg.get("target_key", "target_img"))
     target_mode = str(data_cfg.get("target_mode", "middle"))
     window_size = int(data_cfg.get("window_size", cfg["model"].get("params", {}).get("n_frames", 1)))
+    train_frame_stride = int(data_cfg.get("frame_stride", 1))
+    eval_frame_stride = int(data_cfg.get("eval_frame_stride", train_frame_stride))
     foreground_mask_cfg = data_cfg.get("foreground_mask", {})
     include_mask = bool(foreground_mask_cfg.get("enable", True))
     mask_threshold_abs = float(foreground_mask_cfg.get("threshold_abs", 1e-6))
@@ -856,6 +859,7 @@ def build_structeit_baseline_dataloaders(cfg: dict, seed: int):
         input_key=input_key,
         target_key=target_key,
         window_size=window_size,
+        frame_stride=train_frame_stride,
         target_mode=target_mode,
         include_mask=include_mask,
         mask_threshold_abs=mask_threshold_abs,
@@ -876,6 +880,7 @@ def build_structeit_baseline_dataloaders(cfg: dict, seed: int):
         input_key=input_key,
         target_key=target_key,
         window_size=window_size,
+        frame_stride=train_frame_stride,
         target_mode=target_mode,
         recon_transform=train_recon_transform,
         include_mask=include_mask,
@@ -887,6 +892,7 @@ def build_structeit_baseline_dataloaders(cfg: dict, seed: int):
         input_key=input_key,
         target_key=target_key,
         window_size=window_size,
+        frame_stride=eval_frame_stride,
         target_mode=target_mode,
         recon_transform=eval_recon_transform,
         include_mask=include_mask,
@@ -898,6 +904,9 @@ def build_structeit_baseline_dataloaders(cfg: dict, seed: int):
         "num_workers": num_workers,
         "pin_memory": torch.cuda.is_available(),
     }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(data_cfg.get("persistent_workers", True))
+        loader_kwargs["prefetch_factor"] = int(data_cfg.get("prefetch_factor", 4))
     train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
     val_loaders = {"val": DataLoader(val_ds, shuffle=False, **loader_kwargs)}
 
@@ -909,6 +918,8 @@ def build_structeit_baseline_dataloaders(cfg: dict, seed: int):
         "input_key": input_key,
         "target_key": target_key,
         "window_size": window_size,
+        "train_frame_stride": train_frame_stride,
+        "eval_frame_stride": eval_frame_stride,
         "target_mode": target_mode,
         "foreground_mask": {
             "enable": include_mask,
@@ -923,7 +934,8 @@ def build_structeit_baseline_dataloaders(cfg: dict, seed: int):
         "📊 StructEIT Split: "
         f"TrainCases={len(case_splits['train'])}, ValCases={len(case_splits['val'])}, "
         f"TestCases={len(case_splits['test'])} | "
-        f"TrainSamples={len(train_ds)}, ValSamples={len(val_ds)}"
+        f"TrainSamples={len(train_ds)}, ValSamples={len(val_ds)} | "
+        f"TrainStride={train_frame_stride}, EvalStride={eval_frame_stride}"
     )
     return train_loader, val_loaders, split_info
 
@@ -1715,12 +1727,17 @@ def train_pipeline(cfg: dict) -> None:
 
     logging_cfg = cfg.get("logging", {})
     save_freq = int(logging_cfg.get("save_freq", 10))
+    val_freq = int(logging_cfg.get("val_freq", 1))
     epochs = int(train_cfg["epochs"])
+    amp_cfg = train_cfg.get("amp", {})
+    amp_enabled = device.type == "cuda" and bool(amp_cfg.get("enable", True))
+    grad_scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     print(
         f"🎯 Monitor: {monitor_key} ({monitor_mode}) | "
         f"LossWeights: l1={loss_weights['l1']}, roi={loss_weights['roi']}, "
-        f"edge={loss_weights['edge']}, temporal={loss_weights['temporal']}"
+        f"edge={loss_weights['edge']}, temporal={loss_weights['temporal']} | "
+        f"AMP={'on' if amp_enabled else 'off'}"
     )
 
     for epoch in range(1, epochs + 1):
@@ -1734,20 +1751,27 @@ def train_pipeline(cfg: dict) -> None:
             mask = extras.get("mask")
 
             optimizer.zero_grad(set_to_none=True)
-            preds = forward_model(model, model_inputs)
-            loss, loss_parts = compute_loss(
-                preds=preds,
-                targets=targets,
-                mask=mask,
-                l1_crit=l1_crit,
-                roi_crit=roi_crit,
-                edge_crit=edge_crit,
-                temporal_crit=temporal_crit,
-                loss_weights=loss_weights,
-            )
+            amp_context = torch.cuda.amp.autocast if amp_enabled else nullcontext
+            with amp_context():
+                preds = forward_model(model, model_inputs)
+                loss, loss_parts = compute_loss(
+                    preds=preds,
+                    targets=targets,
+                    mask=mask,
+                    l1_crit=l1_crit,
+                    roi_crit=roi_crit,
+                    edge_crit=edge_crit,
+                    temporal_crit=temporal_crit,
+                    loss_weights=loss_weights,
+                )
 
-            loss.backward()
-            optimizer.step()
+            if amp_enabled:
+                grad_scaler.scale(loss).backward()
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
             train_loss_acc += loss.item()
             for name in train_part_acc:
@@ -1759,23 +1783,27 @@ def train_pipeline(cfg: dict) -> None:
         if scheduler is not None:
             scheduler.step()
 
+        should_validate = val_freq <= 1 or epoch % val_freq == 0 or epoch == 1 or epoch == epochs
         eval_metrics: dict[str, float] = {}
-        for split_name, loader in val_loaders.items():
-            split_metrics = evaluate_loader(
-                model=model,
-                loader=loader,
-                device=device,
-                prefix=split_name,
-                l1_crit=l1_crit,
-                roi_crit=roi_crit,
-                edge_crit=edge_crit,
-                temporal_crit=temporal_crit,
-                loss_weights=loss_weights,
-                roi_margin=roi_margin,
-                roi_mask_threshold=roi_mask_threshold,
-            )
-            eval_metrics.update(split_metrics)
-            print_split_metrics(split_name, split_metrics)
+        if should_validate:
+            for split_name, loader in val_loaders.items():
+                split_metrics = evaluate_loader(
+                    model=model,
+                    loader=loader,
+                    device=device,
+                    prefix=split_name,
+                    l1_crit=l1_crit,
+                    roi_crit=roi_crit,
+                    edge_crit=edge_crit,
+                    temporal_crit=temporal_crit,
+                    loss_weights=loss_weights,
+                    roi_margin=roi_margin,
+                    roi_mask_threshold=roi_mask_threshold,
+                )
+                eval_metrics.update(split_metrics)
+                print_split_metrics(split_name, split_metrics)
+        else:
+            print(f"  ⏭️ Skip validation at epoch {epoch} (val_freq={val_freq})")
 
         row = {
             "epoch": epoch,
@@ -1783,7 +1811,7 @@ def train_pipeline(cfg: dict) -> None:
             "train/lr": optimizer.param_groups[0]["lr"],
             **train_part_avg,
             **eval_metrics,
-            "monitor/value": eval_metrics.get(monitor_key, float("nan")),
+            "monitor/value": eval_metrics.get(monitor_key, best_monitor_value if best_monitor_value is not None else float("nan")),
         }
         with open(csv_file, "a", encoding="utf-8", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=csv_fields)
@@ -1794,7 +1822,7 @@ def train_pipeline(cfg: dict) -> None:
             primary_vis_loader = next(iter(val_loaders.values()))
 
         wandb_images = None
-        if epoch % save_freq == 0:
+        if should_validate and epoch % save_freq == 0:
             wandb_images = visualize_and_save(model, primary_vis_loader, device, save_dir, epoch)
 
         if wandb_enabled:
@@ -1809,24 +1837,25 @@ def train_pipeline(cfg: dict) -> None:
                 log_data["examples"] = wandb_images
             wandb.log(log_data)
 
-        for split_name in val_loaders:
-            split_ssim_key = f"{split_name}/ssim"
-            split_ssim = eval_metrics.get(split_ssim_key, float("nan"))
-            if is_improved(split_ssim, best_split_ssim[split_name], mode="max", min_delta=0.0):
-                best_split_ssim[split_name] = split_ssim
-                torch.save(model.state_dict(), save_dir / f"best_{split_name}_ssim.pth")
-                print(f"  🔥 Best {split_name} SSIM Updated!")
+        if should_validate:
+            for split_name in val_loaders:
+                split_ssim_key = f"{split_name}/ssim"
+                split_ssim = eval_metrics.get(split_ssim_key, float("nan"))
+                if is_improved(split_ssim, best_split_ssim[split_name], mode="max", min_delta=0.0):
+                    best_split_ssim[split_name] = split_ssim
+                    torch.save(model.state_dict(), save_dir / f"best_{split_name}_ssim.pth")
+                    print(f"  🔥 Best {split_name} SSIM Updated!")
 
-        current_monitor = eval_metrics.get(monitor_key, float("nan"))
-        if is_improved(current_monitor, best_monitor_value, mode=monitor_mode, min_delta=early_stop_min_delta):
-            best_monitor_value = current_monitor
-            early_stop_bad_epochs = 0
-            torch.save(model.state_dict(), save_dir / "best.pth")
-            if monitor_metric == "ssim":
-                torch.save(model.state_dict(), save_dir / "best_ssim.pth")
-            print(f"  ✅ Monitor Improved: {monitor_key}={format_metric_value(current_monitor)}")
-        else:
-            early_stop_bad_epochs += 1
+            current_monitor = eval_metrics.get(monitor_key, float("nan"))
+            if is_improved(current_monitor, best_monitor_value, mode=monitor_mode, min_delta=early_stop_min_delta):
+                best_monitor_value = current_monitor
+                early_stop_bad_epochs = 0
+                torch.save(model.state_dict(), save_dir / "best.pth")
+                if monitor_metric == "ssim":
+                    torch.save(model.state_dict(), save_dir / "best_ssim.pth")
+                print(f"  ✅ Monitor Improved: {monitor_key}={format_metric_value(current_monitor)}")
+            else:
+                early_stop_bad_epochs += 1
 
         torch.save(model.state_dict(), save_dir / "last.pth")
 

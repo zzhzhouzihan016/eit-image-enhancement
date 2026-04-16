@@ -185,6 +185,7 @@ class StructEITSequenceDataset(Dataset):
         input_key: str = "greit_img",
         target_key: str = "target_img",
         window_size: int = 1,
+        frame_stride: int = 1,
         target_mode: str = "middle",
         recon_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
         target_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
@@ -197,11 +198,14 @@ class StructEITSequenceDataset(Dataset):
 
         if window_size <= 0:
             raise ValueError("window_size 必须是正整数。")
+        if frame_stride <= 0:
+            raise ValueError("frame_stride 必须是正整数。")
 
         self.dataset_root = resolve_structeit_dataset_root(dataset_root)
         self.input_key = input_key
         self.target_key = target_key
         self.window_size = int(window_size)
+        self.frame_stride = int(frame_stride)
         self.target_mode = str(target_mode).lower()
         self.recon_transform = recon_transform
         self.target_transform = target_transform
@@ -229,7 +233,7 @@ class StructEITSequenceDataset(Dataset):
         for record in self.records:
             if record.num_frames < self.window_size:
                 continue
-            for start in range(record.num_frames - self.window_size + 1):
+            for start in range(0, record.num_frames - self.window_size + 1, self.frame_stride):
                 index.append((record, start))
         return index
 
@@ -283,6 +287,7 @@ class StructEITSequenceDataset(Dataset):
                 "window_start": int(start_index),
                 "window_stop": int(stop_index),
                 "window_size": int(self.window_size),
+                "frame_stride": int(self.frame_stride),
                 "target_mode": self.target_mode,
                 "target_frame_index": target_frame_index,
                 "num_frames": int(record.num_frames),

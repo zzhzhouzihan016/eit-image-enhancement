@@ -10,6 +10,8 @@ data:
   input_key: "greit_img"
   target_key: "target_img"
   window_size: 1
+  frame_stride: 2
+  eval_frame_stride: 2
   target_mode: "middle"
   batch_size: 8
   num_workers: 0
@@ -49,6 +51,9 @@ train:
   weight_decay: 1e-5
   optimizer: "AdamW"
   scheduler: "CosineAnnealingLR"
+
+  amp:
+    enable: false
 
   loss_weights:
     l1: 1.0
