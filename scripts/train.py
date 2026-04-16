@@ -1802,7 +1802,7 @@ def train_pipeline(cfg: dict) -> None:
     epochs = int(train_cfg["epochs"])
     amp_cfg = train_cfg.get("amp", {})
     amp_enabled = device.type == "cuda" and bool(amp_cfg.get("enable", True))
-    grad_scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    grad_scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     print(
         f"🎯 Monitor: {monitor_key} ({monitor_mode}) | "
@@ -1822,8 +1822,8 @@ def train_pipeline(cfg: dict) -> None:
             mask = extras.get("mask")
 
             optimizer.zero_grad(set_to_none=True)
-            amp_context = torch.cuda.amp.autocast if amp_enabled else nullcontext
-            with amp_context():
+            amp_context = torch.amp.autocast("cuda") if amp_enabled else nullcontext()
+            with amp_context:
                 preds = forward_model(model, model_inputs)
                 loss, loss_parts = compute_loss(
                     preds=preds,
