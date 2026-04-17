@@ -1,13 +1,13 @@
 # ================= 实验基本信息 =================
-experiment_name: "exp108_structeit_cached_unet_v1"
-save_dir: "outputs/experiments/exp108_structeit_cached_unet_v1"
+experiment_name: "exp109_structeit_cached_unet_w5"
+save_dir: "outputs/experiments/exp109_structeit_cached_unet_w5"
 seed: 42
 
 # ================= 数据集配置 =================
 data:
   dataset_type: "structeit_cached"
-  cache_root: "data/cache/structeit_baseline_stride2"
-  batch_size: 256
+  cache_root: "data/cache/structeit_window5_stride2"
+  batch_size: 96
   num_workers: 4
   persistent_workers: true
   prefetch_factor: 4
@@ -17,7 +17,7 @@ data:
 model:
   name: "st_unet"
   params:
-    n_frames: 1
+    n_frames: 5
     n_classes: 1
     bilinear: true
 
@@ -43,7 +43,7 @@ train:
   monitor_mode: "max"
 
   early_stopping:
-    enable: true
+    enable: false
     patience: 8
     min_delta: 0.0
 
@@ -56,5 +56,5 @@ wandb:
   enable: false
   project: "EIT_Enhancement"
   entity: null
-  name: "Exp108_StructEIT_Cached_UNet_v1"
-  tags: ["structeit", "cached", "baseline", "single-source", "single-frame", "unet"]
+  name: "Exp109_StructEIT_Cached_UNet_W5"
+  tags: ["structeit", "cached", "window5", "single-source", "temporal-test", "unet"]

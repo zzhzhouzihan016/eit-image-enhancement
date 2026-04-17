@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -98,7 +99,16 @@ def _stack_and_save_shard(
         "window_starts": list(window_starts),
         "target_frame_indices": list(target_frame_indices),
     }
-    torch.save(payload, shard_path)
+    temp_path = shard_path.with_suffix(f"{shard_path.suffix}.tmp")
+    try:
+        torch.save(payload, temp_path)
+    except RuntimeError as exc:
+        # Some remote/container filesystems are unstable with the default zip
+        # serializer for large tensors, so fall back to the legacy format.
+        if temp_path.exists():
+            temp_path.unlink()
+        torch.save(payload, temp_path, _use_new_zipfile_serialization=False)
+    os.replace(temp_path, shard_path)
 
     return {
         "filename": shard_path.name,
