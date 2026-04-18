@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # ================= 配置区 =================
 MAT_PATH = PROJECT_ROOT / "data/processed/train_sim/mat/eit_pathology_dataHR_200seq.mat"
+MAT_PATH_FALLBACK = PROJECT_ROOT / "data/processed/train_sim/mat/sample2000_seq32_type5_simdata.mat"
 REF_REAL_DATA_PATH = PROJECT_ROOT / "data/processed/npz_norm/250kHzHR/250kHzHR_normalized_0p1_99p9.npz"
 SAVE_PATH = PROJECT_ROOT / "data/processed/train_sim/npz/eit_pathology_dataHR_200seq.npz"
 DISPLAY_SIZE = (252, 176)
@@ -26,10 +27,15 @@ def create_blue_black_cmap():
 
 
 def convert_and_process():
-    print(f"🚀 开始极速转换流程: {MAT_PATH}")
+    mat_path = MAT_PATH if os.path.exists(MAT_PATH) else MAT_PATH_FALLBACK
+    print(f"🚀 开始极速转换流程: {mat_path}")
 
-    if not os.path.exists(MAT_PATH):
-        raise FileNotFoundError(f"❌ 找不到文件: {MAT_PATH}")
+    if not os.path.exists(mat_path):
+        raise FileNotFoundError(
+            "❌ 找不到 MATLAB 数据文件，已尝试:\n"
+            f"   - {MAT_PATH}\n"
+            f"   - {MAT_PATH_FALLBACK}"
+        )
 
     # ================= 1. 读取参考真实数据 =================
     use_hist_match = False
@@ -51,7 +57,7 @@ def convert_and_process():
 
     # ================= 2. Chunk-by-Chunk 内存优化处理 =================
     print("📂 正在打开 MATLAB v7.3 大文件 (h5py 流式读取)...")
-    with h5py.File(MAT_PATH, 'r') as f:
+    with h5py.File(mat_path, 'r') as f:
         # MATLAB 中的 [N, T, H, W] 在 HDF5 中是反过来的 [W, H, T, N]
         shape_in = f['input_data'].shape
         W, H, T, N = shape_in
